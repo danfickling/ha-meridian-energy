@@ -1,0 +1,75 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Energy Account Login",
+        "description": "Select your electricity supplier and enter your account credentials.",
+        "data": {
+          "supplier": "Supplier",
+          "network": "Network region",
+          "email": "Email address",
+          "password": "Password",
+          "history_start": "History start date",
+          "cookie": "Browser cookie (optional)"
+        },
+        "data_description": {
+          "supplier": "Choose your electricity supplier. Both Powershop and Meridian Energy portals are supported.",
+          "network": "The electricity network your property is connected to. This determines the TOU (time-of-use) schedule boundaries.",
+          "history_start": "Start date for historical data import in DD/MM/YYYY format (e.g. 01/06/2023). Leave empty for a rolling 365-day window.",
+          "cookie": "Optional: paste the Cookie header from your browser (DevTools > Network tab) to bypass captcha or 2FA. Leave empty for normal login."
+        }
+      },
+      "reauth_confirm": {
+        "title": "Re-authenticate",
+        "description": "Your {supplier} credentials have expired or are invalid. Please re-enter them.",
+        "data": {
+          "email": "Email address",
+          "password": "Password",
+          "cookie": "Browser cookie (optional)"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Invalid credentials — login failed. Please check your email, password and supplier selection.",
+      "cannot_connect": "Unable to connect to the supplier portal. Please try again later.",
+      "invalid_date": "Invalid date format — please enter a date in DD/MM/YYYY format (e.g. 01/06/2023)."
+    },
+    "abort": {
+      "already_configured": "This account is already configured.",
+      "reauth_successful": "Re-authentication was successful."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Supplier & Network",
+        "description": "Choose your electricity supplier and network region.",
+        "data": {
+          "supplier": "Supplier",
+          "network": "Network region"
+        },
+        "data_description": {
+          "supplier": "Change your electricity supplier portal. This changes which website the integration logs into.",
+          "network": "Change your electricity network region. If the TOU schedule is different, a new schedule entry will be added while historical data keeps the old boundaries."
+        }
+      },
+      "rates": {
+        "title": "Rates & History",
+        "description": "Configure rate type, historical data range, and authentication.",
+        "data": {
+          "rate_type": "Rate type",
+          "history_start": "History start date",
+          "cookie": "Browser cookie (optional)"
+        },
+        "data_description": {
+          "rate_type": "Choose 'Special' for discount rates or 'Base' for standard rates.",
+          "history_start": "Start date for historical data import in DD/MM/YYYY format (e.g. 01/06/2023). Leave empty for a rolling 365-day window.",
+          "cookie": "Optional: paste the Cookie header from your browser to bypass captcha or 2FA. The cookie will be tried first; if expired, normal login is used as fallback."
+        }
+      }
+    },
+    "error": {
+      "invalid_date": "Invalid date format — please enter a date in DD/MM/YYYY format (e.g. 01/06/2023)."
+    }
+  }
+}

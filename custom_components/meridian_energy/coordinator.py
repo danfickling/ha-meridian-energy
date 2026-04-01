@@ -15,7 +15,7 @@ from __future__ import annotations
 import csv
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, date, timedelta
+from datetime import datetime, date
 from io import StringIO
 from pathlib import Path
 
@@ -170,8 +170,6 @@ class MeridianCoordinator(DataUpdateCoordinator[MeridianData]):
         self._supplier = supplier
         self._sensor_name = SUPPLIER_CONFIG[supplier]["name"]
         self._period_meta = _build_period_meta(self._sensor_name)
-        self._last_csv_date: str | None = None  # DD/MM/YYYY of last processed row
-        self._force_full_import: bool = False    # Set by reimport service
 
     @property
     def rate_type(self) -> str:
@@ -250,8 +248,6 @@ class MeridianCoordinator(DataUpdateCoordinator[MeridianData]):
 
     async def async_reimport_history(self) -> None:
         """Re-download and reprocess all CSV history."""
-        self._force_full_import = True
-        self._last_csv_date = None
         await self.async_refresh()
 
     async def async_check_schedule(self) -> dict:
@@ -358,30 +354,13 @@ class MeridianCoordinator(DataUpdateCoordinator[MeridianData]):
                             self._schedule_cache.network,
                         )
 
-                # Download and process CSV
-                # Incremental: if we have a last date and not forcing full import,
-                # fetch only data from (last_date - 2 days) to catch any late-arriving rows
-                date_from = None
-                if self._last_csv_date and not self._force_full_import:
-                    try:
-                        last_dt = datetime.strptime(self._last_csv_date, "%d/%m/%Y")
-                        # Overlap by 2 days to catch late-arriving/corrected rows
-                        incremental_start = last_dt - timedelta(days=2)
-                        date_from = incremental_start.strftime("%d/%m/%Y")
-                        _LOGGER.debug(
-                            "Incremental CSV fetch from %s", date_from
-                        )
-                    except ValueError:
-                        date_from = None
-
-                csv_text = self._api.get_data(date_from=date_from)
+                # Download and process CSV (always full history for correct
+                # cumulative statistics — fetched once per 24 h cycle)
+                csv_text = self._api.get_data()
                 if csv_text:
                     csv_result = self._process_csv(csv_text)
                     if csv_result is not None:
                         stats, daily, solar, solar_kwh, has_solar, stats_rows, stats_days = csv_result
-                        # Track the last date for incremental fetches
-                        self._last_csv_date = now.strftime("%d/%m/%Y")
-                        self._force_full_import = False
             else:
                 raise ConfigEntryAuthFailed(
                     f"{self._sensor_name} login failed — credentials may be invalid"

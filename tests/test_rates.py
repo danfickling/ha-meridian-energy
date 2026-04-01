@@ -106,6 +106,20 @@ class TestRateCacheNeedsRefresh:
     def test_invalid_timestamp(self):
         assert self._make_cache("garbage").needs_refresh() is True
 
+    def test_month_boundary_triggers_refresh(self):
+        """Refresh triggers when a new calendar month has started."""
+        now = datetime.now()
+        if now.month == 1:
+            prev_month = datetime(now.year - 1, 12, 15)
+        else:
+            prev_month = datetime(now.year, now.month - 1, 15)
+        assert self._make_cache(prev_month.isoformat()).needs_refresh() is True
+
+    def test_same_month_no_refresh(self):
+        """No refresh if still in the same month and cache is young."""
+        recent = datetime(datetime.now().year, datetime.now().month, 1, 0, 1).isoformat()
+        assert self._make_cache(recent).needs_refresh() is False
+
 
 
 class TestRateCacheGetRates:

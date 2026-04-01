@@ -477,14 +477,25 @@ class ScheduleCache:
         return get_boundary_times(self.get_schedule_for())
 
     def needs_check(self) -> bool:
-        """Return True when we should re-scrape the Get Shifty page."""
+        """Return True when we should re-scrape the Get Shifty page.
+
+        Triggers when the cache is older than CHECK_INTERVAL_DAYS
+        **or** when a new calendar month has started since the last check
+        (to detect schedule changes at month boundaries promptly).
+        """
         ts = self._data.get("last_checked")
         if not ts:
             return True
         try:
             last = datetime.fromisoformat(ts)
-            age = (datetime.now() - last).total_seconds() / 86400
-            return age >= CHECK_INTERVAL_DAYS
+            now = datetime.now()
+            age = (now - last).total_seconds() / 86400
+            if age >= CHECK_INTERVAL_DAYS:
+                return True
+            # Also check at the start of a new month
+            if (now.year, now.month) != (last.year, last.month):
+                return True
+            return False
         except (ValueError, TypeError):
             return True
 

@@ -182,14 +182,25 @@ class RateCache:
                 tmp.unlink(missing_ok=True)
 
     def needs_refresh(self) -> bool:
-        """Return True when a new scrape is due."""
+        """Return True when a new scrape is due.
+
+        Triggers when the cache is older than REFRESH_INTERVAL_DAYS
+        **or** when a new calendar month has started since the last scrape
+        (to pick up monthly price changes promptly).
+        """
         ts = self._data.get("last_updated")
         if not ts:
             return True
         try:
             last = datetime.fromisoformat(ts)
-            age_days = (datetime.now() - last).total_seconds() / 86400
-            return age_days >= REFRESH_INTERVAL_DAYS
+            now = datetime.now()
+            age_days = (now - last).total_seconds() / 86400
+            if age_days >= REFRESH_INTERVAL_DAYS:
+                return True
+            # Also refresh at the start of a new month
+            if (now.year, now.month) != (last.year, last.month):
+                return True
+            return False
         except (ValueError, TypeError):
             return True
 

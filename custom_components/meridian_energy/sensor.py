@@ -1,12 +1,12 @@
-"""Sensor entities for Meridian Energy / Powershop integration.
+"""Sensor entities for Meridian Energy / Powershop integration (v2).
 
-Creates 12 sensor entities under a single device:
-  - 5 per-period kWh rates (night, peak, offpeak, weekend, controlled)
+Creates sensor entities under a single device:
+  - Dynamic per-period kWh rate sensors (created from plan TOU periods)
   - 1 daily connection charge
-  - 1 current rate (updates at TOU boundary times, includes diagnostics)
+  - 1 current rate (updates at TOU boundary times)
   - 1 TOU period name (updates at TOU boundary times)
   - 1 solar export (disabled by default; shows 0 if no solar data)
-  - 1 account balance (NZD credit from portal)
+  - 1 account balance (NZD credit from ledger)
   - 1 future packs value
   - 1 daily cost
 """
@@ -14,74 +14,66 @@ Creates 12 sensor entities under a single device:
 from __future__ import annotations
 
 import logging
+from datetime import date
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
     SensorEntity,
     SensorStateClass,
+    RestoreSensor,
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import UnitOfEnergy
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.event import async_track_time_change
-from homeassistant.helpers.restore_state import RestoreEntity
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import (
     DOMAIN,
-    SUPPLIER_CONFIG,
-    SUPPLIER_POWERSHOP,
-    DEFAULT_SUPPLIER,
-    PERIOD_NIGHT,
-    PERIOD_PEAK,
-    PERIOD_OFFPEAK,
-    PERIOD_WEEKEND_OFFPEAK,
-    PERIOD_CONTROLLED,
+    BRAND_CONFIG,
+    DEFAULT_BRAND,
 )
+from .rates import period_display_name
 from .coordinator import MeridianCoordinator
 from . import MeridianConfigEntry
 
 _LOGGER = logging.getLogger(__name__)
 
-# (period_key, display_name, icon)
-RATE_SENSOR_DEFS = [
-    (PERIOD_NIGHT, "Night Rate", "mdi:weather-night"),
-    (PERIOD_PEAK, "Peak Rate", "mdi:flash-alert"),
-    (PERIOD_OFFPEAK, "Off-Peak Rate", "mdi:flash-outline"),
-    (PERIOD_WEEKEND_OFFPEAK, "Weekend Off-Peak Rate", "mdi:calendar-weekend"),
-    (PERIOD_CONTROLLED, "Controlled Rate", "mdi:water-boiler"),
-]
+PARALLEL_UPDATES = 0
 
-PERIOD_DISPLAY_NAMES: dict[str, str] = {
-    "night": "Night",
-    "peak": "Peak",
-    "offpeak": "Off-Peak",
-    "weekend_offpeak": "Weekend Off-Peak",
-    "controlled": "Controlled",
+# Icon lookup for known periods; unknown periods get the default icon.
+_PERIOD_ICONS: dict[str, str] = {
+    "night": "mdi:weather-night",
+    "peak": "mdi:flash-alert",
+    "offpeak": "mdi:flash-outline",
+    "controlled": "mdi:water-boiler",
 }
-
+_DEFAULT_PERIOD_ICON = "mdi:flash"
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: MeridianConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up sensor entities from a config entry."""
     coordinator = entry.runtime_data.coordinator
 
     entities: list[SensorEntity] = []
 
-    # Live / boundary-reactive sensors first
+    # Live / boundary-reactive sensors
     entities.append(MeridianCurrentRateSensor(coordinator, entry))
     entities.append(MeridianTOUPeriodSensor(coordinator, entry))
 
-    # Per-period rate sensors
-    for period, name, icon in RATE_SENSOR_DEFS:
+    # Per-period rate sensors — created dynamically from detected periods
+    for period in (coordinator.data.detected_periods if coordinator.data else []):
+        display = period_display_name(period)
+        icon = _PERIOD_ICONS.get(period, _DEFAULT_PERIOD_ICON)
         entities.append(
-            MeridianRateSensor(coordinator, entry, period, name, icon)
+            MeridianRateSensor(coordinator, entry, period, f"{display} Rate", icon)
         )
 
     # Daily charge
@@ -90,13 +82,33 @@ async def async_setup_entry(
     # Solar export (always created — shows 0 if no solar data)
     entities.append(MeridianSolarExportSensor(coordinator, entry))
 
-    # Account balance, future packs, daily cost
+    # Account balance, future packs
     entities.append(MeridianBalanceSensor(coordinator, entry))
     entities.append(MeridianFuturePacksSensor(coordinator, entry))
-    entities.append(MeridianDailyCostSensor(coordinator, entry))
+
+    # Billing cycle
+    entities.append(MeridianBillingPeriodStartSensor(coordinator, entry))
+    entities.append(MeridianBillingPeriodEndSensor(coordinator, entry))
+    entities.append(MeridianNextBillingDateSensor(coordinator, entry))
 
     async_add_entities(entities)
 
+    # Remove stale per-period rate sensors when detected periods change
+    # (e.g. plan changes from having "controlled" to not having it).
+    current_rate_uids = {
+        f"{entry.entry_id}_rate_{p}"
+        for p in (coordinator.data.detected_periods if coordinator.data else [])
+    }
+    ent_reg = er.async_get(hass)
+    for ent_entry in er.async_entries_for_config_entry(ent_reg, entry.entry_id):
+        if (
+            ent_entry.unique_id.startswith(f"{entry.entry_id}_rate_")
+            and ent_entry.unique_id not in current_rate_uids
+        ):
+            _LOGGER.info(
+                "Removing stale rate sensor: %s", ent_entry.entity_id,
+            )
+            ent_reg.async_remove(ent_entry.entity_id)
 
 
 class MeridianBaseSensor(
@@ -123,8 +135,8 @@ class MeridianBaseSensor(
     @property
     def device_info(self) -> DeviceInfo:
         """Return device info linking all sensors together."""
-        supplier = self.coordinator.supplier
-        config = SUPPLIER_CONFIG.get(supplier, SUPPLIER_CONFIG[DEFAULT_SUPPLIER])
+        brand = self.coordinator.brand
+        config = BRAND_CONFIG.get(brand, BRAND_CONFIG[DEFAULT_BRAND])
         return DeviceInfo(
             identifiers={(DOMAIN, self._entry.entry_id)},
             name=self.coordinator.sensor_name,
@@ -152,10 +164,6 @@ class MeridianRateSensor(MeridianBaseSensor):
     ) -> None:
         super().__init__(coordinator, entry, f"rate_{period}", name, icon)
         self._period = period
-        # Disable entity by default when the rate table doesn't include this period
-        detected = coordinator.data and coordinator.data.detected_periods
-        if detected and period not in detected:
-            self._attr_entity_registry_enabled_default = False
 
     @property
     def native_value(self) -> float | None:
@@ -164,25 +172,12 @@ class MeridianRateSensor(MeridianBaseSensor):
             return self.coordinator.data.rates.get(self._period)
         return None
 
-    @property
-    def extra_state_attributes(self) -> dict:
-        """Include both base and special rates."""
-        if not self.coordinator.data:
-            return {}
-        return {
-            "base_rate": self.coordinator.data.base_rates.get(self._period),
-            "special_rate": self.coordinator.data.special_rates.get(
-                self._period
-            ),
-            "active_rate_type": self.coordinator.data.rate_type,
-        }
 
 
-
-class MeridianDailyChargeSensor(MeridianBaseSensor, RestoreEntity):
+class MeridianDailyChargeSensor(MeridianBaseSensor, RestoreSensor):
     """Daily connection charge (NZD/day).
 
-    ``RestoreEntity`` keeps the last daily charge across restarts.
+    ``RestoreSensor`` keeps the last daily charge across restarts.
     """
 
     _attr_native_unit_of_measurement = "NZD/day"
@@ -202,9 +197,9 @@ class MeridianDailyChargeSensor(MeridianBaseSensor, RestoreEntity):
     async def async_added_to_hass(self) -> None:
         """Restore last state on startup."""
         await super().async_added_to_hass()
-        if (last_state := await self.async_get_last_state()) is not None:
+        if (data := await self.async_get_last_sensor_data()) is not None:
             try:
-                self._restored_value = float(last_state.state)
+                self._restored_value = float(data.native_value)
             except (ValueError, TypeError):
                 self._restored_value = None
 
@@ -214,25 +209,15 @@ class MeridianDailyChargeSensor(MeridianBaseSensor, RestoreEntity):
             return self.coordinator.data.daily_charge
         return self._restored_value
 
-    @property
-    def extra_state_attributes(self) -> dict:
-        if not self.coordinator.data:
-            return {}
-        return {
-            "base_daily": self.coordinator.data.base_daily,
-            "special_daily": self.coordinator.data.special_daily,
-            "active_rate_type": self.coordinator.data.rate_type,
-        }
 
 
-
-class MeridianCurrentRateSensor(MeridianBaseSensor, RestoreEntity):
+class MeridianCurrentRateSensor(MeridianBaseSensor, RestoreSensor):
     """Current NZD/kWh rate based on the active TOU period.
 
     Updates from the coordinator AND at TOU boundary times
     so it reacts instantly to period transitions.
 
-    Inherits ``RestoreEntity`` so the last known rate survives HA
+    Inherits ``RestoreSensor`` so the last known rate survives HA
     restarts and is available immediately (before the first poll
     completes login + CSV download).
     """
@@ -256,13 +241,13 @@ class MeridianCurrentRateSensor(MeridianBaseSensor, RestoreEntity):
         await super().async_added_to_hass()
 
         # Restore previous value so sensor isn't "unavailable" on startup
-        if (last_state := await self.async_get_last_state()) is not None:
+        if (data := await self.async_get_last_sensor_data()) is not None:
             try:
-                self._restored_value = float(last_state.state)
+                self._restored_value = float(data.native_value)
             except (ValueError, TypeError):
                 self._restored_value = None
 
-        boundary_times = self.coordinator.schedule_cache.get_boundary_times()
+        boundary_times = self.coordinator.get_boundary_times()
         for hour, minute in boundary_times:
             self.async_on_remove(
                 async_track_time_change(
@@ -290,34 +275,23 @@ class MeridianCurrentRateSensor(MeridianBaseSensor, RestoreEntity):
     def extra_state_attributes(self) -> dict:
         period = self.coordinator.get_current_tou_period()
         d = self.coordinator.data
-        attrs = {
-            "tou_period": PERIOD_DISPLAY_NAMES.get(period, period),
-            "rate_type": d.rate_type if d else None,
+        attrs: dict = {
+            "tou_period": period_display_name(period),
         }
         if d:
-            # Schedule info
-            if d.schedule_summary:
-                attrs["schedule"] = d.schedule_summary
-            # Diagnostics (previously on status sensor)
+            attrs["product"] = d.product
             attrs["last_usage_update"] = (
                 d.last_usage_update.isoformat() if d.last_usage_update else None
             )
-            attrs["last_rate_scrape"] = d.last_rate_scrape
-            attrs["cache_months_special"] = d.cache_months_special
-            attrs["cache_months_base"] = d.cache_months_base
-            attrs["stats_days_processed"] = d.stats_days
-            attrs["stats_rows_processed"] = d.stats_rows
-            attrs["network"] = d.schedule_network
-            attrs["schedule_changed"] = d.schedule_changed
         return attrs
 
 
 
-class MeridianTOUPeriodSensor(MeridianBaseSensor, RestoreEntity):
-    """Current TOU period name (Night / Peak / Off-Peak / Weekend Off-Peak).
+class MeridianTOUPeriodSensor(MeridianBaseSensor, RestoreSensor):
+    """Current TOU period name (Night / Peak / Off-Peak / Controlled).
 
     Updates at TOU boundary times for instant period transitions.
-    ``RestoreEntity`` keeps the last period name across restarts.
+    ``RestoreSensor`` keeps the last period name across restarts.
     """
 
     def __init__(
@@ -334,11 +308,11 @@ class MeridianTOUPeriodSensor(MeridianBaseSensor, RestoreEntity):
         """Restore last state and register TOU boundary listeners."""
         await super().async_added_to_hass()
 
-        if (last_state := await self.async_get_last_state()) is not None:
-            if last_state.state not in (None, "unknown", "unavailable"):
-                self._restored_value = last_state.state
+        if (data := await self.async_get_last_sensor_data()) is not None:
+            if data.native_value not in (None, "unknown", "unavailable"):
+                self._restored_value = str(data.native_value)
 
-        boundary_times = self.coordinator.schedule_cache.get_boundary_times()
+        boundary_times = self.coordinator.get_boundary_times()
         for hour, minute in boundary_times:
             self.async_on_remove(
                 async_track_time_change(
@@ -356,17 +330,8 @@ class MeridianTOUPeriodSensor(MeridianBaseSensor, RestoreEntity):
 
     @property
     def native_value(self) -> str:
-        # TOU period is always computable from current time + schedule,
-        # so coordinator data is not required for the primary value.
         period = self.coordinator.get_current_tou_period()
-        return PERIOD_DISPLAY_NAMES.get(period, self._restored_value or "Off-Peak")
-
-    @property
-    def extra_state_attributes(self) -> dict:
-        attrs = {}
-        if self.coordinator.data and self.coordinator.data.schedule_summary:
-            attrs["schedule"] = self.coordinator.data.schedule_summary
-        return attrs
+        return period_display_name(period) if period else (self._restored_value or "Off-Peak")
 
 
 
@@ -411,16 +376,15 @@ class MeridianSolarExportSensor(MeridianBaseSensor):
 
 
 
-class MeridianBalanceSensor(MeridianBaseSensor, RestoreEntity):
+class MeridianBalanceSensor(MeridianBaseSensor, RestoreSensor):
     """Account credit balance in NZD.
 
     Shows "You're about $NNN ahead" from the balance page.
-    ``RestoreEntity`` keeps the last balance across restarts.
+    ``RestoreSensor`` keeps the last balance across restarts.
     """
 
     _attr_device_class = SensorDeviceClass.MONETARY
     _attr_native_unit_of_measurement = "NZD"
-    _attr_state_class = SensorStateClass.TOTAL
     _attr_suggested_display_precision = 0
 
     def __init__(
@@ -432,15 +396,13 @@ class MeridianBalanceSensor(MeridianBaseSensor, RestoreEntity):
             coordinator, entry, "balance", "Account Balance", "mdi:wallet"
         )
         self._restored_value: float | None = None
-        if coordinator.supplier != SUPPLIER_POWERSHOP:
-            self._attr_entity_registry_enabled_default = False
 
     async def async_added_to_hass(self) -> None:
         """Restore last state on startup."""
         await super().async_added_to_hass()
-        if (last_state := await self.async_get_last_state()) is not None:
+        if (data := await self.async_get_last_sensor_data()) is not None:
             try:
-                self._restored_value = float(last_state.state)
+                self._restored_value = float(data.native_value)
             except (ValueError, TypeError):
                 self._restored_value = None
 
@@ -452,16 +414,16 @@ class MeridianBalanceSensor(MeridianBaseSensor, RestoreEntity):
         return self._restored_value
 
 
-class MeridianFuturePacksSensor(MeridianBaseSensor, RestoreEntity):
+class MeridianFuturePacksSensor(MeridianBaseSensor, RestoreSensor):
     """Pre-purchased Future Packs value in NZD.
 
     Shows "You also have $N,NNN in pre-purchased Future Packs" from the
-    balance page.
+    balance page.  Disabled by default for Meridian Energy customers
+    (Future Packs are a Powershop-specific feature).
     """
 
     _attr_device_class = SensorDeviceClass.MONETARY
     _attr_native_unit_of_measurement = "NZD"
-    _attr_state_class = SensorStateClass.TOTAL
     _attr_suggested_display_precision = 0
 
     def __init__(
@@ -472,16 +434,16 @@ class MeridianFuturePacksSensor(MeridianBaseSensor, RestoreEntity):
         super().__init__(
             coordinator, entry, "future_packs", "Future Packs", "mdi:package-variant-closed"
         )
-        self._restored_value: float | None = None
-        if coordinator.supplier != SUPPLIER_POWERSHOP:
+        if coordinator.brand == "meridian_energy":
             self._attr_entity_registry_enabled_default = False
+        self._restored_value: float | None = None
 
     async def async_added_to_hass(self) -> None:
         """Restore last state on startup."""
         await super().async_added_to_hass()
-        if (last_state := await self.async_get_last_state()) is not None:
+        if (data := await self.async_get_last_sensor_data()) is not None:
             try:
-                self._restored_value = float(last_state.state)
+                self._restored_value = float(data.native_value)
             except (ValueError, TypeError):
                 self._restored_value = None
 
@@ -493,16 +455,10 @@ class MeridianFuturePacksSensor(MeridianBaseSensor, RestoreEntity):
         return self._restored_value
 
 
-class MeridianDailyCostSensor(MeridianBaseSensor, RestoreEntity):
-    """Estimated daily electricity cost in NZD.
+class MeridianBillingPeriodStartSensor(MeridianBaseSensor):
+    """Start date of the current billing period."""
 
-    Shows "You're currently using about $NN.NN per day" from the
-    balance page.
-    """
-
-    _attr_native_unit_of_measurement = "NZD/day"
-    _attr_state_class = SensorStateClass.MEASUREMENT
-    _attr_suggested_display_precision = 2
+    _attr_device_class = SensorDeviceClass.DATE
 
     def __init__(
         self,
@@ -510,24 +466,59 @@ class MeridianDailyCostSensor(MeridianBaseSensor, RestoreEntity):
         entry: ConfigEntry,
     ) -> None:
         super().__init__(
-            coordinator, entry, "daily_cost", "Daily Cost", "mdi:cash-clock"
+            coordinator, entry, "billing_period_start",
+            "Billing Period Start", "mdi:calendar-start",
         )
-        self._restored_value: float | None = None
-        if coordinator.supplier != SUPPLIER_POWERSHOP:
-            self._attr_entity_registry_enabled_default = False
-
-    async def async_added_to_hass(self) -> None:
-        """Restore last state on startup."""
-        await super().async_added_to_hass()
-        if (last_state := await self.async_get_last_state()) is not None:
-            try:
-                self._restored_value = float(last_state.state)
-            except (ValueError, TypeError):
-                self._restored_value = None
 
     @property
-    def native_value(self) -> float | None:
-        bal = self.coordinator.data and self.coordinator.data.balance
-        if bal and bal.get("daily_cost") is not None:
-            return bal["daily_cost"]
-        return self._restored_value
+    def native_value(self) -> date | None:
+        raw = self.coordinator.data and self.coordinator.data.billing_period_start
+        if raw:
+            return date.fromisoformat(raw)
+        return None
+
+
+class MeridianBillingPeriodEndSensor(MeridianBaseSensor):
+    """End date of the current billing period."""
+
+    _attr_device_class = SensorDeviceClass.DATE
+
+    def __init__(
+        self,
+        coordinator: MeridianCoordinator,
+        entry: ConfigEntry,
+    ) -> None:
+        super().__init__(
+            coordinator, entry, "billing_period_end",
+            "Billing Period End", "mdi:calendar-end",
+        )
+
+    @property
+    def native_value(self) -> date | None:
+        raw = self.coordinator.data and self.coordinator.data.billing_period_end
+        if raw:
+            return date.fromisoformat(raw)
+        return None
+
+
+class MeridianNextBillingDateSensor(MeridianBaseSensor):
+    """Date the next bill will be issued."""
+
+    _attr_device_class = SensorDeviceClass.DATE
+
+    def __init__(
+        self,
+        coordinator: MeridianCoordinator,
+        entry: ConfigEntry,
+    ) -> None:
+        super().__init__(
+            coordinator, entry, "next_billing_date",
+            "Next Billing Date", "mdi:calendar-alert",
+        )
+
+    @property
+    def native_value(self) -> date | None:
+        raw = self.coordinator.data and self.coordinator.data.next_billing_date
+        if raw:
+            return date.fromisoformat(raw)
+        return None

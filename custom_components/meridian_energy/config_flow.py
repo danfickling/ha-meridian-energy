@@ -1,287 +1,431 @@
-"""Config flow for Meridian Energy / Powershop integration."""
+"""Config flow for Meridian Energy / Powershop integration (v2 — OTP auth)."""
 
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from uuid import uuid4
 
+import aiohttp
 import voluptuous as vol
 
 from homeassistant import config_entries
-from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
+from homeassistant.config_entries import ConfigFlowResult
+from homeassistant.const import CONF_EMAIL
 import homeassistant.helpers.config_validation as cv
-from homeassistant.data_entry_flow import FlowResult
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
-from .api import MeridianEnergyApi
-from requests.exceptions import RequestException
+from .api import (
+    MeridianEnergyApi,
+    AuthError,
+    ApiError,
+    async_send_otp_email,
+    async_validate_otp,
+)
 from .const import (
     DOMAIN,
-    CONF_RATE_TYPE,
-    CONF_NETWORK,
-    CONF_SUPPLIER,
-    CONF_HISTORY_START,
-    CONF_COOKIE,
-    DEFAULT_RATE_TYPE,
-    DEFAULT_NETWORK,
-    DEFAULT_SUPPLIER,
-    DEFAULT_HISTORY_START,
-    SUPPLIER_CONFIG,
+    CONF_BRAND,
+    CONF_REFRESH_TOKEN,
+    CONF_ACCOUNT_NUMBER,
+    BRAND_CONFIG,
+    DEFAULT_BRAND,
 )
-from .schedule import NETWORKS
 
 _LOGGER = logging.getLogger(__name__)
 
-_DATE_RE_PATTERN = r"^\d{2}/\d{2}/\d{4}$"
-
-
-def _validate_history_start(value: str) -> str:
-    """Return *value* unchanged if empty or valid DD/MM/YYYY, else raise."""
-    value = value.strip()
-    if not value:
-        return value
-    try:
-        datetime.strptime(value, "%d/%m/%Y")
-    except ValueError:
-        raise vol.Invalid(
-            f"Invalid date '{value}' — expected DD/MM/YYYY format (e.g. 01/06/2023)"
-        )
-    return value
-
 
 class MeridianConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
-    """Handle config flow for Meridian Energy / Powershop."""
+    """Handle config flow for Meridian Energy / Powershop (v2)."""
 
-    VERSION = 1
+    VERSION = 2
 
-    async def async_step_user(self, user_input=None):
-        """Handle the initial setup step — supplier, credentials, network, history."""
+    def __init__(self) -> None:
+        self._email: str = ""
+        self._brand: str = DEFAULT_BRAND
+        self._journey_id: str = ""
+        self._refresh_token: str = ""
+        self._accounts: list[dict] = []
+
+    # -- Initial setup -------------------------------------------------------
+
+    async def async_step_user(
+        self, user_input: dict | None = None,
+    ) -> ConfigFlowResult:
+        """Step 1: Email and brand selection — sends OTP email."""
         errors: dict[str, str] = {}
 
         if user_input is not None:
-            supplier = user_input.get(CONF_SUPPLIER, DEFAULT_SUPPLIER)
-            email = user_input[CONF_EMAIL]
-            password = user_input[CONF_PASSWORD]
-            cookie = user_input.get(CONF_COOKIE, "")
-            supplier_name = SUPPLIER_CONFIG[supplier]["name"]
+            self._email = user_input[CONF_EMAIL].strip().lower()
+            self._brand = user_input.get(CONF_BRAND, DEFAULT_BRAND)
 
-            # Validate history_start format
-            history_start = user_input.get(CONF_HISTORY_START, DEFAULT_HISTORY_START)
+            # Send OTP email
+            self._journey_id = str(uuid4())
+            session = async_get_clientsession(self.hass)
             try:
-                history_start = _validate_history_start(history_start)
-            except vol.Invalid:
-                errors[CONF_HISTORY_START] = "invalid_date"
-                history_start = None
+                await async_send_otp_email(
+                    session, self._email, self._brand,
+                    journey_id=self._journey_id,
+                )
+            except AuthError as err:
+                if "email_not_found" in str(err):
+                    errors[CONF_EMAIL] = "email_not_found"
+                else:
+                    errors["base"] = "cannot_connect"
+            except (aiohttp.ClientError, TimeoutError):
+                errors["base"] = "cannot_connect"
 
             if not errors:
-                # Unique-ID: one entry per email+supplier combination
-                unique_id = f"{supplier}_{email.lower().strip()}"
-                await self.async_set_unique_id(unique_id)
-                self._abort_if_unique_id_configured()
+                return await self.async_step_otp()
 
-                # Validate credentials before creating the entry
-                api = MeridianEnergyApi(
-                    email, password, supplier=supplier, cookie=cookie,
-                )
-                try:
-                    valid = await self.hass.async_add_executor_job(
-                        api.validate_credentials
-                    )
-                except RequestException:
-                    errors["base"] = "cannot_connect"
-                    valid = False
-
-                if valid:
-                    return self.async_create_entry(
-                        title=supplier_name,
-                        data={
-                            CONF_SUPPLIER: supplier,
-                            CONF_EMAIL: email,
-                            CONF_PASSWORD: password,
-                            CONF_NETWORK: user_input.get(CONF_NETWORK, DEFAULT_NETWORK),
-                            CONF_HISTORY_START: history_start or DEFAULT_HISTORY_START,
-                            CONF_COOKIE: cookie,
-                        },
-                    )
-                if not errors:
-                    errors["base"] = "invalid_auth"
-
-        # Build dropdowns
-        supplier_options = {k: v["name"] for k, v in SUPPLIER_CONFIG.items()}
-        network_options = {k: v for k, v in NETWORKS.items()}
+        brand_options = {k: v["name"] for k, v in BRAND_CONFIG.items()}
 
         return self.async_show_form(
             step_id="user",
             data_schema=vol.Schema(
                 {
-                    vol.Required(CONF_SUPPLIER, default=DEFAULT_SUPPLIER): vol.In(
-                        supplier_options
-                    ),
-                    vol.Required(CONF_NETWORK, default=DEFAULT_NETWORK): vol.In(
-                        network_options
-                    ),
+                    vol.Required(
+                        CONF_BRAND, default=DEFAULT_BRAND
+                    ): vol.In(brand_options),
                     vol.Required(CONF_EMAIL): cv.string,
-                    vol.Required(CONF_PASSWORD): cv.string,
-                    vol.Optional(
-                        CONF_HISTORY_START, default=DEFAULT_HISTORY_START
-                    ): cv.string,
-                    vol.Optional(CONF_COOKIE, default=""): cv.string,
                 }
             ),
             errors=errors,
         )
 
-    @staticmethod
-    def async_get_options_flow(config_entry):
-        """Return the options flow handler."""
-        return MeridianOptionsFlow()
+    async def async_step_otp(
+        self, user_input: dict | None = None,
+    ) -> ConfigFlowResult:
+        """Step 2: Validate OTP code, discover account, create entry."""
+        errors: dict[str, str] = {}
 
-    # -- Reauth flow -------------------------------------------------------
+        if user_input is not None:
+            raw = user_input["otp"].strip()
+            session = async_get_clientsession(self.hass)
+            tokens = None
+
+            try:
+                tokens = await async_validate_otp(
+                    session, self._email, raw, self._brand,
+                    journey_id=self._journey_id,
+                )
+            except AuthError:
+                errors["base"] = "invalid_otp"
+            except (aiohttp.ClientError, TimeoutError):
+                errors["base"] = "cannot_connect"
+
+            if tokens:
+                id_token = tokens.get("idToken")
+                refresh_token = tokens.get("refreshToken")
+                if not id_token or not refresh_token:
+                    errors["base"] = "invalid_otp"
+                else:
+                    self._refresh_token = refresh_token
+
+                    # Discover accounts
+                    try:
+                        accounts = await MeridianEnergyApi.async_discover_accounts(
+                            session, id_token, self._brand,
+                        )
+                    except (AuthError, ApiError) as err:
+                        _LOGGER.error("Account discovery failed: %s", err)
+                        errors["base"] = "account_not_found"
+                        accounts = []
+
+                    if accounts:
+                        if len(accounts) == 1:
+                            account_number = accounts[0].get("number", "")
+                            return await self._async_create_account_entry(
+                                account_number,
+                            )
+                        # Multiple accounts — let the user choose
+                        self._accounts = accounts
+                        return await self.async_step_select_account()
+
+        return self.async_show_form(
+            step_id="otp",
+            description_placeholders={"email": self._email},
+            data_schema=vol.Schema(
+                {
+                    vol.Required("otp"): cv.string,
+                }
+            ),
+            errors=errors,
+        )
+
+    # -- Account selection ---------------------------------------------------
+
+    async def async_step_select_account(
+        self, user_input: dict | None = None,
+    ) -> ConfigFlowResult:
+        """Step 3 (optional): Select account when multiple are found."""
+        if user_input is not None:
+            return await self._async_create_account_entry(
+                user_input["account"],
+            )
+
+        account_options = {
+            a.get("number", ""): a.get("number", "")
+            for a in self._accounts
+            if a.get("number")
+        }
+        return self.async_show_form(
+            step_id="select_account",
+            data_schema=vol.Schema(
+                {
+                    vol.Required("account"): vol.In(account_options),
+                }
+            ),
+        )
+
+    async def _async_create_account_entry(
+        self, account_number: str,
+    ) -> ConfigFlowResult:
+        """Create a config entry for the selected account."""
+        # One entry per brand + email + account
+        unique_id = f"{self._brand}_{self._email}_{account_number}"
+        await self.async_set_unique_id(unique_id)
+        self._abort_if_unique_id_configured()
+
+        brand_name = BRAND_CONFIG[self._brand]["name"]
+        return self.async_create_entry(
+            title=f"{brand_name} ({account_number})",
+            data={
+                CONF_EMAIL: self._email,
+                CONF_BRAND: self._brand,
+                CONF_REFRESH_TOKEN: self._refresh_token,
+                CONF_ACCOUNT_NUMBER: account_number,
+            },
+        )
+
+    # -- Reauth flow ---------------------------------------------------------
 
     async def async_step_reauth(
-        self, entry_data: dict
-    ) -> FlowResult:
-        """Handle reauth when credentials become invalid."""
+        self, entry_data: dict,
+    ) -> ConfigFlowResult:
+        """Handle reauth when the refresh token expires."""
+        self._email = entry_data.get(CONF_EMAIL, "")
+        self._brand = entry_data.get(CONF_BRAND, DEFAULT_BRAND)
         return await self.async_step_reauth_confirm()
 
     async def async_step_reauth_confirm(
-        self, user_input: dict | None = None
-    ) -> FlowResult:
-        """Prompt user to re-enter credentials."""
+        self, user_input: dict | None = None,
+    ) -> ConfigFlowResult:
+        """Send OTP for reauth (shows a confirm button)."""
         errors: dict[str, str] = {}
-        reauth_entry = self._get_reauth_entry()
-        current_email = reauth_entry.data.get(CONF_EMAIL, "")
-        supplier = reauth_entry.data.get(CONF_SUPPLIER, DEFAULT_SUPPLIER)
-        supplier_name = SUPPLIER_CONFIG[supplier]["name"]
 
         if user_input is not None:
-            email = user_input[CONF_EMAIL]
-            password = user_input[CONF_PASSWORD]
-            cookie = user_input.get(CONF_COOKIE, "")
-
-            # Validate new credentials before updating
-            api = MeridianEnergyApi(
-                email, password, supplier=supplier, cookie=cookie,
-            )
+            self._journey_id = str(uuid4())
+            session = async_get_clientsession(self.hass)
             try:
-                valid = await self.hass.async_add_executor_job(
-                    api.validate_credentials
+                await async_send_otp_email(
+                    session, self._email, self._brand,
+                    journey_id=self._journey_id,
                 )
-            except RequestException:
+            except (AuthError, aiohttp.ClientError, TimeoutError):
                 errors["base"] = "cannot_connect"
-                valid = False
 
-            if valid:
-                return self.async_update_reload_and_abort(
-                    reauth_entry,
-                    data={
-                        **reauth_entry.data,
-                        CONF_EMAIL: email,
-                        CONF_PASSWORD: password,
-                        CONF_COOKIE: cookie,
-                    },
-                )
-            errors["base"] = "invalid_auth"
+            if not errors:
+                return await self.async_step_reauth_otp()
 
         return self.async_show_form(
             step_id="reauth_confirm",
-            description_placeholders={"supplier": supplier_name},
+            description_placeholders={
+                "email": self._email,
+                "brand": BRAND_CONFIG[self._brand]["name"],
+            },
+            data_schema=vol.Schema({}),
+            errors=errors,
+        )
+
+    async def async_step_reauth_otp(
+        self, user_input: dict | None = None,
+    ) -> ConfigFlowResult:
+        """Validate reauth OTP code and update tokens."""
+        errors: dict[str, str] = {}
+        reauth_entry = self._get_reauth_entry()
+
+        if user_input is not None:
+            raw = user_input["otp"].strip()
+            session = async_get_clientsession(self.hass)
+
+            try:
+                tokens = await async_validate_otp(
+                    session, self._email, raw, self._brand,
+                    journey_id=self._journey_id,
+                )
+                refresh_token = tokens.get("refreshToken") if tokens else None
+                if refresh_token:
+                    return self.async_update_reload_and_abort(
+                        reauth_entry,
+                        data={
+                            **reauth_entry.data,
+                            CONF_REFRESH_TOKEN: refresh_token,
+                        },
+                    )
+                errors["base"] = "invalid_otp"
+            except AuthError:
+                errors["base"] = "invalid_otp"
+            except (aiohttp.ClientError, TimeoutError):
+                errors["base"] = "cannot_connect"
+
+        return self.async_show_form(
+            step_id="reauth_otp",
+            description_placeholders={"email": self._email},
             data_schema=vol.Schema(
                 {
-                    vol.Required(CONF_EMAIL, default=current_email): cv.string,
-                    vol.Required(CONF_PASSWORD): cv.string,
-                    vol.Optional(CONF_COOKIE, default=""): cv.string,
+                    vol.Required("otp"): cv.string,
                 }
             ),
             errors=errors,
         )
 
+    # -- Reconfigure flow ----------------------------------------------------
 
-class MeridianOptionsFlow(config_entries.OptionsFlow):
-    """Handle options — two steps: supplier/network, then rate type + history."""
-
-    def __init__(self) -> None:
-        """Initialise options flow state."""
-        self._options: dict = {}
-
-    async def async_step_init(self, user_input=None):
-        """Step 1: Supplier and network selection."""
-        if user_input is not None:
-            self._options.update(user_input)
-            return await self.async_step_rates()
-
-        current_supplier = (
-            self.config_entry.options.get(CONF_SUPPLIER)
-            or self.config_entry.data.get(CONF_SUPPLIER, DEFAULT_SUPPLIER)
-        )
-        current_network = (
-            self.config_entry.options.get(CONF_NETWORK)
-            or self.config_entry.data.get(CONF_NETWORK, DEFAULT_NETWORK)
-        )
-
-        supplier_options = {k: v["name"] for k, v in SUPPLIER_CONFIG.items()}
-        network_options = {k: v for k, v in NETWORKS.items()}
-
-        return self.async_show_form(
-            step_id="init",
-            data_schema=vol.Schema(
-                {
-                    vol.Required(
-                        CONF_SUPPLIER, default=current_supplier
-                    ): vol.In(supplier_options),
-                    vol.Required(
-                        CONF_NETWORK, default=current_network
-                    ): vol.In(network_options),
-                }
-            ),
-        )
-
-    async def async_step_rates(self, user_input=None):
-        """Step 2: Rate type, history start, and cookie auth."""
+    async def async_step_reconfigure(
+        self, user_input: dict | None = None,
+    ) -> ConfigFlowResult:
+        """Allow the user to change email, brand, or account."""
         errors: dict[str, str] = {}
-
-        current_rate_type = self.config_entry.options.get(
-            CONF_RATE_TYPE, DEFAULT_RATE_TYPE
-        )
-        current_history_start = (
-            self.config_entry.options.get(CONF_HISTORY_START)
-            or self.config_entry.data.get(CONF_HISTORY_START, DEFAULT_HISTORY_START)
-        )
-        current_cookie = (
-            self.config_entry.options.get(CONF_COOKIE)
-            or self.config_entry.data.get(CONF_COOKIE, "")
-        )
+        reconfigure_entry = self._get_reconfigure_entry()
 
         if user_input is not None:
-            # Validate history_start format
-            raw_date = user_input.get(CONF_HISTORY_START, "")
+            self._email = user_input[CONF_EMAIL].strip().lower()
+            self._brand = user_input.get(CONF_BRAND, DEFAULT_BRAND)
+
+            self._journey_id = str(uuid4())
+            session = async_get_clientsession(self.hass)
             try:
-                _validate_history_start(raw_date)
-            except vol.Invalid:
-                errors[CONF_HISTORY_START] = "invalid_date"
+                await async_send_otp_email(
+                    session, self._email, self._brand,
+                    journey_id=self._journey_id,
+                )
+            except AuthError as err:
+                if "email_not_found" in str(err):
+                    errors[CONF_EMAIL] = "email_not_found"
+                else:
+                    errors["base"] = "cannot_connect"
+            except (aiohttp.ClientError, TimeoutError):
+                errors["base"] = "cannot_connect"
 
             if not errors:
-                self._options.update(user_input)
-                return self.async_create_entry(data=self._options)
+                return await self.async_step_reconfigure_otp()
 
-            # Preserve user's input as defaults when re-showing with errors
-            current_rate_type = user_input.get(CONF_RATE_TYPE, current_rate_type)
-            current_history_start = user_input.get(CONF_HISTORY_START, current_history_start)
-            current_cookie = user_input.get(CONF_COOKIE, current_cookie)
-
-        fields: dict = {}
-        fields[vol.Required(CONF_RATE_TYPE, default=current_rate_type)] = vol.In(
-            {
-                "special": "Special (discount rates)",
-                "base": "Base (standard rates)",
-            }
-        )
-        fields[vol.Optional(CONF_HISTORY_START, default=current_history_start)] = (
-            cv.string
-        )
-        fields[vol.Optional(CONF_COOKIE, default=current_cookie)] = cv.string
+        current_email = reconfigure_entry.data.get(CONF_EMAIL, "")
+        current_brand = reconfigure_entry.data.get(CONF_BRAND, DEFAULT_BRAND)
+        brand_options = {k: v["name"] for k, v in BRAND_CONFIG.items()}
 
         return self.async_show_form(
-            step_id="rates",
-            data_schema=vol.Schema(fields),
+            step_id="reconfigure",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        CONF_BRAND, default=current_brand,
+                    ): vol.In(brand_options),
+                    vol.Required(
+                        CONF_EMAIL, default=current_email,
+                    ): cv.string,
+                }
+            ),
             errors=errors,
+        )
+
+    async def async_step_reconfigure_otp(
+        self, user_input: dict | None = None,
+    ) -> ConfigFlowResult:
+        """Validate OTP and discover accounts for reconfigure."""
+        errors: dict[str, str] = {}
+        reconfigure_entry = self._get_reconfigure_entry()
+
+        if user_input is not None:
+            raw = user_input["otp"].strip()
+            session = async_get_clientsession(self.hass)
+            tokens = None
+
+            try:
+                tokens = await async_validate_otp(
+                    session, self._email, raw, self._brand,
+                    journey_id=self._journey_id,
+                )
+            except AuthError:
+                errors["base"] = "invalid_otp"
+            except (aiohttp.ClientError, TimeoutError):
+                errors["base"] = "cannot_connect"
+
+            if tokens:
+                id_token = tokens.get("idToken")
+                refresh_token = tokens.get("refreshToken")
+                if not id_token or not refresh_token:
+                    errors["base"] = "invalid_otp"
+                else:
+                    self._refresh_token = refresh_token
+
+                    try:
+                        accounts = await MeridianEnergyApi.async_discover_accounts(
+                            session, id_token, self._brand,
+                        )
+                    except (AuthError, ApiError) as err:
+                        _LOGGER.error("Account discovery failed: %s", err)
+                        errors["base"] = "account_not_found"
+                        accounts = []
+
+                    if accounts:
+                        if len(accounts) == 1:
+                            account_number = accounts[0].get("number", "")
+                            return self._update_account_entry(
+                                reconfigure_entry, account_number,
+                            )
+                        self._accounts = accounts
+                        return await self.async_step_reconfigure_select_account()
+
+        return self.async_show_form(
+            step_id="reconfigure_otp",
+            description_placeholders={"email": self._email},
+            data_schema=vol.Schema(
+                {
+                    vol.Required("otp"): cv.string,
+                }
+            ),
+            errors=errors,
+        )
+
+    async def async_step_reconfigure_select_account(
+        self, user_input: dict | None = None,
+    ) -> ConfigFlowResult:
+        """Select account during reconfigure when multiple are found."""
+        reconfigure_entry = self._get_reconfigure_entry()
+
+        if user_input is not None:
+            return self._update_account_entry(
+                reconfigure_entry, user_input["account"],
+            )
+
+        account_options = {
+            a.get("number", ""): a.get("number", "")
+            for a in self._accounts
+            if a.get("number")
+        }
+        return self.async_show_form(
+            step_id="reconfigure_select_account",
+            data_schema=vol.Schema(
+                {
+                    vol.Required("account"): vol.In(account_options),
+                }
+            ),
+        )
+
+    def _update_account_entry(
+        self, entry: config_entries.ConfigEntry, account_number: str,
+    ) -> ConfigFlowResult:
+        """Update the existing config entry with new credentials."""
+        brand_name = BRAND_CONFIG[self._brand]["name"]
+        new_uid = f"{self._brand}_{self._email}_{account_number}"
+        return self.async_update_reload_and_abort(
+            entry,
+            unique_id=new_uid,
+            title=f"{brand_name} ({account_number})",
+            data={
+                CONF_EMAIL: self._email,
+                CONF_BRAND: self._brand,
+                CONF_REFRESH_TOKEN: self._refresh_token,
+                CONF_ACCOUNT_NUMBER: account_number,
+            },
         )

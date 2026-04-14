@@ -9,6 +9,6 @@
   "iot_class": "cloud_polling",
   "issue_tracker": "https://github.com/danfickling/ha-meridian-energy/issues",
   "loggers": ["custom_components.meridian_energy"],
-  "requirements": ["beautifulsoup4", "requests"],
-  "version": "1.0.1"
+  "requirements": [],
+  "version": "2.0.0"
 }

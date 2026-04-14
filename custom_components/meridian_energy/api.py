@@ -1,391 +1,703 @@
-"""Meridian Energy / Powershop API client."""
+"""Kraken GraphQL API client for Meridian Energy / Powershop (v2).
+
+Authenticates via Firebase (email OTP / magic-link), then queries
+the per-brand Kraken GraphQL endpoint for account data, consumption
+measurements, rates, TOU schedules, and ledger balances.
+"""
 
 from __future__ import annotations
 
 import logging
-import re
-import requests
-from requests.exceptions import RequestException
+from datetime import datetime
 
-from datetime import datetime, timedelta
-from bs4 import BeautifulSoup
+import aiohttp
 
 from .const import (
-    SUPPLIER_CONFIG,
-    SUPPLIER_POWERSHOP,
-    SUPPLIER_MERIDIAN,
-    DEFAULT_SUPPLIER,
-    CONF_COOKIE,
-    HTTP_TIMEOUT,
-    HTTP_TIMEOUT_COOKIE_CHECK,
-    DEFAULT_LOOKBACK_DAYS,
+    BRAND_CONFIG,
+    DEFAULT_BRAND,
+    FIREBASE_API_KEY,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Firebase REST helpers
+# ---------------------------------------------------------------------------
+_FIREBASE_TOKEN_URL = (
+    "https://securetoken.googleapis.com/v1/token?key={key}"
+)
+_FIREBASE_SIGNIN_CUSTOM_TOKEN_URL = (
+    "https://identitytoolkit.googleapis.com/v1/accounts:signInWithCustomToken?key={key}"
+)
+
+# Cloudflare blocks non-browser User-Agents (error 1010).
+_BROWSER_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/135.0.0.0 Safari/537.36"
+)
+
+
+class AuthError(Exception):
+    """Raised when authentication fails (invalid credentials / token)."""
+
+
+class ApiError(Exception):
+    """Raised on non-auth GraphQL or HTTP errors."""
+
+
+# ---------------------------------------------------------------------------
+# Auth helpers (static — used by config flow before an Api instance exists)
+# ---------------------------------------------------------------------------
+
+async def async_send_otp_email(
+    session: aiohttp.ClientSession,
+    email: str,
+    brand: str = DEFAULT_BRAND,
+    *,
+    journey_id: str | None = None,
+) -> None:
+    """Trigger an OTP / magic-link email via the brand's auth endpoint.
+
+    Raises ``AuthError`` on failure (e.g. user not found).
+    """
+    cfg = BRAND_CONFIG[brand]
+    url = f"https://{cfg['auth_domain']}/cf/email-connector"
+    payload: dict[str, object] = {
+        "brand": brand,
+        "email": email,
+        "redirectUrl": f"{cfg['app_origin']}/login",
+        "otpEnabled": True,
+    }
+    if journey_id:
+        payload["journeyId"] = journey_id
+    headers = {
+        "Content-Type": "application/json",
+        "X-Client-Platform": "web",
+    }
+    async with session.post(url, json=payload, headers=headers) as resp:
+        if resp.status == 404:
+            raise AuthError("email_not_found")
+        if resp.status != 200:
+            body = await resp.text()
+            raise AuthError(f"send_otp_failed ({resp.status}): {body[:200]}")
+
+
+async def async_validate_otp(
+    session: aiohttp.ClientSession,
+    email: str,
+    otp: str,
+    brand: str = DEFAULT_BRAND,
+    *,
+    journey_id: str | None = None,
+) -> dict:
+    """Validate an OTP code and return Firebase tokens.
+
+    Returns ``{"idToken": ..., "refreshToken": ..., "expiresIn": ...}``.
+    Raises ``AuthError`` on invalid OTP.
+    """
+    cfg = BRAND_CONFIG[brand]
+    url = f"https://{cfg['auth_domain']}/cf/email-otp-authenticator"
+    payload: dict[str, str] = {"email": email, "otp": otp, "brand": brand}
+    if journey_id:
+        payload["journeyId"] = journey_id
+    headers = {
+        "Content-Type": "application/json",
+        "X-Client-Platform": "web",
+    }
+
+    async with session.post(url, json=payload, headers=headers) as resp:
+        if resp.status != 200:
+            body = await resp.text()
+            raise AuthError(f"otp_invalid ({resp.status}): {body[:200]}")
+        try:
+            data = await resp.json()
+        except (ValueError, aiohttp.ContentTypeError) as exc:
+            body = await resp.text()
+            raise AuthError(
+                f"Invalid JSON in OTP response: {body[:200]}"
+            ) from exc
+        custom_token = data.get("customToken")
+        if not custom_token:
+            raise AuthError("otp_response_missing_token")
+
+    # Exchange custom token for Firebase ID + refresh tokens
+    url = _FIREBASE_SIGNIN_CUSTOM_TOKEN_URL.format(key=FIREBASE_API_KEY)
+    async with session.post(url, json={"token": custom_token, "returnSecureToken": True}) as resp:
+        if resp.status != 200:
+            body = await resp.text()
+            raise AuthError(f"firebase_custom_token_failed ({resp.status}): {body[:200]}")
+        try:
+            return await resp.json()
+        except (ValueError, aiohttp.ContentTypeError) as exc:
+            body = await resp.text()
+            raise AuthError(
+                f"Invalid JSON in Firebase response: {body[:200]}"
+            ) from exc
+
+
+async def async_refresh_token(
+    session: aiohttp.ClientSession,
+    refresh_token: str,
+) -> dict:
+    """Refresh a Firebase ID token.
+
+    Returns ``{"id_token": ..., "refresh_token": ..., "expires_in": ...}``.
+    Raises ``AuthError`` if the refresh token is revoked or invalid.
+    """
+    url = _FIREBASE_TOKEN_URL.format(key=FIREBASE_API_KEY)
+    async with session.post(
+        url, json={"grant_type": "refresh_token", "refresh_token": refresh_token}
+    ) as resp:
+        if resp.status != 200:
+            body = await resp.text()
+            raise AuthError(f"token_refresh_failed ({resp.status}): {body[:200]}")
+        try:
+            return await resp.json()
+        except (ValueError, aiohttp.ContentTypeError) as exc:
+            body = await resp.text()
+            raise AuthError(
+                f"Invalid JSON in token refresh response: {body[:200]}"
+            ) from exc
+
+
+# ---------------------------------------------------------------------------
+# GraphQL API client
+# ---------------------------------------------------------------------------
 
 class MeridianEnergyApi:
-    """API client for Meridian Energy and Powershop portals."""
+    """Async GraphQL client for the Kraken API (v2)."""
 
-    def __init__(self, email, password, supplier=DEFAULT_SUPPLIER, history_start="", cookie=""):
-        self._email = email
-        self._password = password
-        self._supplier = supplier
-        self._config = SUPPLIER_CONFIG[supplier]
-        self._history_start = history_start  # DD/MM/YYYY or empty for rolling
-        self._cookie = cookie  # Optional browser cookie for auth fallback
-        self._url_base = self._config["base_url"]
-        self._token = None
-        self._data = None
-        self._session = requests.Session()
-        self._logged_in = False
-
-    @property
-    def session(self):
-        return self._session
+    def __init__(
+        self,
+        brand: str,
+        refresh_token: str,
+        account_number: str,
+        session: aiohttp.ClientSession | None = None,
+    ) -> None:
+        self._brand = brand
+        self._config = BRAND_CONFIG[brand]
+        self._refresh_token = refresh_token
+        self._account_number = account_number
+        self._id_token: str | None = None
+        self._owns_session = session is None
+        self._session = session or aiohttp.ClientSession()
 
     @property
-    def logged_in(self) -> bool:
-        return self._logged_in
+    def brand(self) -> str:
+        return self._brand
 
     @property
-    def supplier(self) -> str:
-        return self._supplier
-
-    @supplier.setter
-    def supplier(self, value: str) -> None:
-        self._supplier = value
-        self._config = SUPPLIER_CONFIG[value]
-        self._url_base = self._config["base_url"]
-        self._logged_in = False
+    def account_number(self) -> str:
+        return self._account_number
 
     @property
-    def history_start(self) -> str:
-        """Return the configured history start date (DD/MM/YYYY or empty)."""
-        return self._history_start
+    def refresh_token(self) -> str:
+        return self._refresh_token
 
-    @history_start.setter
-    def history_start(self, value: str) -> None:
-        """Update the history start date."""
-        self._history_start = value
+    async def async_close(self) -> None:
+        """Close the HTTP session if we own it."""
+        if self._owns_session and self._session and not self._session.closed:
+            await self._session.close()
 
-    @property
-    def supplier_name(self) -> str:
-        """Return the display name for the configured supplier."""
-        return self._config["name"]
+    # -- Token management ---------------------------------------------------
 
-    @property
-    def cookie(self) -> str:
-        """Return the configured cookie string."""
-        return self._cookie
+    async def async_ensure_token(self) -> None:
+        """Ensure we have a valid Firebase ID token (refresh if needed)."""
+        if self._id_token:
+            return  # Assume valid; caller retries on 401
+        await self._async_refresh()
 
-    @cookie.setter
-    def cookie(self, value: str) -> None:
-        """Update the cookie string."""
-        self._cookie = value
+    async def _async_refresh(self) -> None:
+        """Refresh the Firebase ID token."""
+        data = await async_refresh_token(self._session, self._refresh_token)
+        self._id_token = data["id_token"]
+        new_refresh = data.get("refresh_token")
+        if new_refresh:
+            self._refresh_token = new_refresh
 
-    def token(self):
-        """Get CSRF token from the login page.
+    def invalidate_token(self) -> None:
+        """Mark the current ID token as expired so the next call refreshes."""
+        self._id_token = None
 
-        If a browser cookie is configured, try cookie-based auth first.
-        Falls back to email/password login if cookie auth fails.
-        """
-        # Create a fresh session for each update cycle to avoid stale cookies
-        if self._session:
-            self._session.close()
-        self._session = requests.Session()
-        self._logged_in = False
-
-        # Try cookie auth first (bypasses captcha/2FA)
-        if self._cookie:
-            if self._try_cookie_auth():
-                return
-
-            _LOGGER.warning(
-                "Cookie auth failed for %s — falling back to email/password",
-                self._config["name"],
-            )
-
-        response = self._session.get(self._url_base, timeout=HTTP_TIMEOUT)
-
-        if response.status_code == 200:
-            soup = BeautifulSoup(response.text, "html.parser")
-            token_el = soup.find("input", {"name": "authenticity_token"})
-            if token_el:
-                self._token = token_el["value"]
-                self.login()
-            else:
-                _LOGGER.error("CSRF token not found on %s login page", self._config["name"])
-        else:
-            _LOGGER.error(
-                "Failed to retrieve the %s token page (status %s)",
-                self._config["name"],
-                response.status_code,
-            )
-
-    def login(self):
-        """Login to the supplier portal.
-
-        Powershop login form action is ``/`` (the site root).
-        Meridian login form posts to ``/customer/login``.
-        """
-        result = False
-        form_data = {
-            "authenticity_token": self._token,
-            "email": self._email,
-            "password": self._password,
-            "commit": "Login",
+    def _headers(self) -> dict[str, str]:
+        """Return headers for a GraphQL request."""
+        return {
+            "Content-Type": "application/json",
+            "User-Agent": _BROWSER_UA,
+            "Authorization": self._id_token or "",
+            "Origin": self._config["app_origin"],
+            "Referer": f"{self._config['app_origin']}/",
         }
 
-        login_url = self._url_base + self._config["login_path"]
+    # -- GraphQL transport --------------------------------------------------
 
-        login_result = self._session.post(
-            login_url,
-            data=form_data,
-            allow_redirects=True,
-            timeout=HTTP_TIMEOUT,
-        )
+    async def _async_graphql(
+        self, query: str, variables: dict | None = None, *, retry_auth: bool = True,
+    ) -> dict:
+        """Execute a GraphQL query, refreshing the token on 401.
 
-        if login_result.status_code == 200:
-            # Check for error messages (account locked, bad password, etc.)
-            fail_text = self._config["login_fail_text"]
-            if fail_text in login_result.text[:1000]:
-                soup = BeautifulSoup(login_result.text, "html.parser")
-                msg_el = soup.find(class_="message")
-                msg = msg_el.get_text(strip=True) if msg_el else "unknown error"
-                _LOGGER.error("%s login failed: %s", self._config["name"], msg)
-            else:
-                _LOGGER.debug("Logged in to %s successfully", self._config["name"])
-                self._logged_in = True
-                result = True
-        else:
-            _LOGGER.error(
-                "%s login POST returned status %s",
-                self._config["name"],
-                login_result.status_code,
+        Returns the ``data`` dict from the response.
+        Raises ``AuthError`` on auth failures, ``ApiError`` on other errors.
+        """
+        await self.async_ensure_token()
+
+        url = self._config["api_url"]
+        payload: dict = {"query": query}
+        if variables:
+            payload["variables"] = variables
+
+        async with self._session.post(
+            url, json=payload, headers=self._headers()
+        ) as resp:
+            if resp.status in (401, 403):
+                if retry_auth:
+                    self._id_token = None
+                    await self._async_refresh()
+                    return await self._async_graphql(
+                        query, variables, retry_auth=False,
+                    )
+                raise AuthError("auth_expired")
+
+            if resp.status != 200:
+                body = await resp.text()
+                raise ApiError(f"HTTP {resp.status}: {body[:300]}")
+
+            try:
+                result = await resp.json()
+            except (ValueError, aiohttp.ContentTypeError) as exc:
+                body = await resp.text()
+                raise ApiError(
+                    f"Invalid JSON response: {body[:300]}"
+                ) from exc
+
+        errors = result.get("errors")
+        if errors:
+            codes = [e.get("extensions", {}).get("errorCode", "") for e in errors]
+            msgs = [e.get("message", "") for e in errors]
+            is_auth = (
+                any("KT-CT-1139" in c or "KT-CT-1111" in c for c in codes)
+                or any("jwt" in m.lower() and "expired" in m.lower() for m in msgs)
             )
+            if is_auth:
+                if retry_auth:
+                    self._id_token = None
+                    await self._async_refresh()
+                    return await self._async_graphql(
+                        query, variables, retry_auth=False,
+                    )
+                raise AuthError(f"auth_error: {msgs}")
+            raise ApiError(f"GraphQL errors: {msgs}")
 
+        return result.get("data", {})
+
+    # -- High-level queries -------------------------------------------------
+
+    async def async_get_account(self) -> dict:
+        """Fetch account details, properties, meter points, and ledgers."""
+        data = await self._async_graphql(
+            _Q_ACCOUNT, {"acct": self._account_number},
+        )
+        return data.get("account", {})
+
+    async def async_get_rates_and_tou(self) -> dict:
+        """Fetch rates and TOU schedule from the active agreement.
+
+        Returns ``{"rates": [...], "tou_schemes": [...], "product": "..."}``.
+        """
+        data = await self._async_graphql(
+            _Q_RATES_TOU, {"acct": self._account_number},
+        )
+        account = data.get("account", {})
+        result: dict = {"rates": [], "tou_schemes": [], "product": ""}
+        for prop in account.get("properties") or []:
+            for mp in prop.get("meterPoints") or []:
+                agreement = mp.get("activeAgreement") or {}
+                result["rates"] = agreement.get("rates") or []
+                result["tou_schemes"] = agreement.get("timeOfUseSchemes") or []
+                product = agreement.get("product") or {}
+                result["product"] = (
+                    product.get("fullName") or product.get("code") or ""
+                    if isinstance(product, dict) else str(product)
+                )
+                if result["rates"]:
+                    return result
         return result
 
-    def _try_cookie_auth(self) -> bool:
-        """Authenticate using a browser cookie header.
-
-        The cookie string should be the value of the ``Cookie`` header
-        copied from a browser session (e.g. from DevTools > Network tab).
-        This bypasses captcha/2FA challenges that may block normal login.
-
-        Returns ``True`` if the cookie session is valid.
-        """
-        try:
-            # Pass cookie in the request (not on session) to avoid leaking
-            # it into subsequent requests if auth fails mid-flight.
-            cookie_header = {"Cookie": self._cookie.strip()}
-
-            # Verify session is valid by requesting the dashboard/home page
-            resp = self._session.get(
-                self._url_base, headers=cookie_header,
-                allow_redirects=False, timeout=HTTP_TIMEOUT_COOKIE_CHECK,
-            )
-
-            # If we get redirected to login, the cookie is invalid
-            if resp.status_code in (301, 302):
-                location = resp.headers.get("Location", "")
-                if "login" in location.lower():
-                    _LOGGER.debug("Cookie auth: redirected to login — cookie expired")
-                    self._session.close()
-                    self._session = requests.Session()
-                    return False
-
-            if resp.status_code == 200:
-                # Check if the page contains authenticated content
-                # (not a login form)
-                fail_text = self._config["login_fail_text"]
-                if fail_text in resp.text[:1000]:
-                    _LOGGER.debug("Cookie auth: got login page — cookie expired")
-                    self._session.close()
-                    self._session = requests.Session()
-                    return False
-
-                # Success — persist cookie on session for subsequent requests
-                self._session.headers["Cookie"] = self._cookie.strip()
-                _LOGGER.info("Cookie auth successful for %s", self._config["name"])
-                self._logged_in = True
-                return True
-
-            _LOGGER.debug("Cookie auth: unexpected status %s", resp.status_code)
-            self._session.close()
-            self._session = requests.Session()
-            return False
-
-        except RequestException as exc:
-            _LOGGER.debug("Cookie auth network error: %s", exc)
-            self._session.close()
-            self._session = requests.Session()
-            return False
-        except (ValueError, KeyError, AttributeError) as exc:
-            _LOGGER.debug("Cookie auth parse error: %s", exc)
-            self._session.close()
-            self._session = requests.Session()
-            return False
-
-    def get_data(
+    async def async_get_measurements(
         self,
-        date_from: str | None = None,
-        date_to: str | None = None,
-    ):
-        """Get consumption data from the API.
+        start: datetime,
+        end: datetime,
+        frequency: str = "DAY_INTERVAL",
+        direction: str = "CONSUMPTION",
+        first: int = 500,
+    ) -> list[dict]:
+        """Fetch consumption/generation measurements.
 
-        Downloads the EIEP 13A CSV for the given date range.
-        The CSV endpoint is the same for both Meridian and Powershop.
-        Defaults: ``date_from=history_start or rolling 365 days``,
-        ``date_to=today``.
-        Date format: ``DD/MM/YYYY``.
+        ``frequency``: DAY_INTERVAL, THIRTY_MIN_INTERVAL, HOUR_INTERVAL, etc.
+        ``direction``: CONSUMPTION or GENERATION.
 
-        Returns the CSV text on success, or ``None`` on failure.
+        Returns a flat list of IntervalMeasurementType dicts.
         """
-        if not self._logged_in:
-            _LOGGER.warning("Not logged in to %s — skipping data fetch", self._config["name"])
-            return None
+        all_nodes: list[dict] = []
+        cursor: str | None = None
 
-        if date_from is None:
-            if self._history_start:
-                date_from = self._history_start
-            else:
-                date_from = (datetime.now() - timedelta(days=DEFAULT_LOOKBACK_DAYS)).strftime("%d/%m/%Y")
-        if date_to is None:
-            date_to = datetime.now().strftime("%d/%m/%Y")
+        _MAX_PAGES = 100
 
-        url = (
-            self._url_base
-            + "reports/consumption_data/detailed_export?date_from="
-            + date_from
-            + "&date_to="
-            + date_to
-            + "&all_icps=&download=true"
-        )
-
-        response = self._session.get(url, timeout=HTTP_TIMEOUT)
-
-        if response.status_code != 200:
-            _LOGGER.error(
-                "Could not fetch consumption data (status %s)", response.status_code
-            )
-            return None
-
-        data = response.text
-        if not data:
-            _LOGGER.warning("Fetched consumption successfully but response was empty")
-            return None
-
-        # Sanity-check: the first line of a valid CSV starts with "HDR"
-        if not data.lstrip().startswith("HDR"):
-            _LOGGER.error(
-                "Consumption response is not CSV (starts with %r) — "
-                "session may have expired",
-                data[:80],
-            )
-            return None
-
-        return data
-
-    def validate_credentials(self) -> bool:
-        """Attempt login and return True if credentials are valid.
-
-        Creates a fresh session, attempts authentication, and returns
-        whether the login succeeded.  Used by the config flow to validate
-        credentials before creating/updating config entries.
-        """
-        try:
-            self.token()
-            return self._logged_in
-        except RequestException as exc:
-            _LOGGER.debug("Credential validation network error: %s", exc)
-            return False
-        except (ValueError, KeyError, AttributeError) as exc:
-            _LOGGER.debug("Credential validation parse error: %s", exc)
-            return False
-
-    def get_balance(self) -> dict[str, float | None] | None:
-        """Fetch account balance info from the portal.
-
-        Both Powershop and Meridian redirect to a balance/dashboard page
-        after login.  Powershop shows:
-        - "You're about $NNN (NN days) ahead" — the account credit
-        - "You also have $N,NNN (NN weeks) in pre-purchased Future Packs."
-        - "You're currently using about $NN.NN per day"
-
-        Returns a dict with keys ``ahead``, ``future_packs``,
-        ``daily_cost`` (all float or None), or ``None`` on failure.
-        """
-        if not self._logged_in:
-            return None
-
-        try:
-            resp = self._session.get(self._url_base, timeout=HTTP_TIMEOUT)
-            if resp.status_code != 200:
-                _LOGGER.debug("Balance page returned status %s", resp.status_code)
-                return None
-
-            # Check if we're actually logged in
-            fail_text = self._config["login_fail_text"]
-            if fail_text in resp.text[:1000]:
-                _LOGGER.debug("Balance page: session expired (got login page)")
-                return None
-
-            soup = BeautifulSoup(resp.text, "html.parser")
-            body_text = soup.get_text(separator=" ", strip=True) if soup.body else ""
-
-            result: dict[str, float | None] = {
-                "ahead": None,
-                "future_packs": None,
-                "daily_cost": None,
+        while True:
+            variables: dict = {
+                "acct": self._account_number,
+                "start": start.isoformat(),
+                "end": end.isoformat(),
+                "first": first,
             }
-
-            # Pattern for dollar amounts (with or without decimals/commas)
-            dollar_re = re.compile(r"\$\s*([\d,]+(?:\.\d{1,2})?)")
-
-            # "You're about $498 (48 days) ahead"
-            ahead_re = re.compile(
-                r"\$\s*([\d,]+(?:\.\d{1,2})?)\s*\([^)]*\)\s*ahead",
-                re.IGNORECASE,
+            query = _Q_MEASUREMENTS.format(
+                frequency=frequency, direction=direction,
             )
-            m = ahead_re.search(body_text)
-            if m:
-                result["ahead"] = float(m.group(1).replace(",", ""))
-                _LOGGER.debug("Balance ahead: $%.2f", result["ahead"])
+            if cursor:
+                variables["after"] = cursor
 
-            # "You also have $1,049 (10 weeks) in pre-purchased Future Packs"
-            packs_re = re.compile(
-                r"\$\s*([\d,]+(?:\.\d{1,2})?)\s*\([^)]*\)\s*in\s+pre-purchased",
-                re.IGNORECASE,
-            )
-            m = packs_re.search(body_text)
-            if m:
-                result["future_packs"] = float(m.group(1).replace(",", ""))
-                _LOGGER.debug("Future packs: $%.2f", result["future_packs"])
+            data = await self._async_graphql(query, variables)
+            account = data.get("account", {})
+            has_next = False
+            for prop in account.get("properties") or []:
+                measurements = prop.get("measurements") or {}
+                for edge in measurements.get("edges") or []:
+                    node = edge.get("node") or {}
+                    if node.get("value") is not None:
+                        all_nodes.append(node)
+                page_info = measurements.get("pageInfo", {})
+                if page_info.get("hasNextPage"):
+                    end_cursor = page_info.get("endCursor")
+                    if not end_cursor:
+                        _LOGGER.warning(
+                            "API returned hasNextPage=true but no endCursor; "
+                            "stopping pagination after %d nodes",
+                            len(all_nodes),
+                        )
+                        break
+                    cursor = end_cursor
+                    has_next = True
 
-            # "You're currently using about $10.30 per day"
-            daily_re = re.compile(
-                r"\$\s*([\d,]+\.\d{2})\s*per\s+day",
-                re.IGNORECASE,
-            )
-            m = daily_re.search(body_text)
-            if m:
-                result["daily_cost"] = float(m.group(1).replace(",", ""))
-                _LOGGER.debug("Daily cost: $%.2f", result["daily_cost"])
+            _MAX_PAGES -= 1
+            if not has_next or _MAX_PAGES <= 0:
+                break
 
-            if any(v is not None for v in result.values()):
-                return result
+        return all_nodes
 
-            _LOGGER.warning(
-                "Could not find balance info on page (text preview: %.200s)",
-                body_text[:200],
-            )
-            return None
+    async def async_get_daily_cost_measurements(
+        self,
+        start: datetime,
+        end: datetime,
+        first: int = 100,
+    ) -> list[dict]:
+        """Fetch daily measurements with cost statistics."""
+        all_nodes: list[dict] = []
+        cursor: str | None = None
+        _MAX_PAGES = 100
 
-        except RequestException as exc:
-            _LOGGER.debug("Balance fetch network error: %s", exc)
-            return None
-        except (ValueError, KeyError, AttributeError) as exc:
-            _LOGGER.debug("Balance parse error: %s", exc)
-            return None
+        while True:
+            variables: dict = {
+                "acct": self._account_number,
+                "start": start.isoformat(),
+                "end": end.isoformat(),
+                "first": first,
+            }
+            if cursor:
+                variables["after"] = cursor
+
+            data = await self._async_graphql(_Q_DAILY_COSTS, variables)
+            account = data.get("account", {})
+            has_next = False
+            for prop in account.get("properties") or []:
+                measurements = prop.get("measurements") or {}
+                for edge in measurements.get("edges") or []:
+                    node = edge.get("node") or {}
+                    if node:
+                        all_nodes.append(node)
+                page_info = measurements.get("pageInfo", {})
+                if page_info.get("hasNextPage"):
+                    end_cursor = page_info.get("endCursor")
+                    if not end_cursor:
+                        _LOGGER.warning(
+                            "API returned hasNextPage=true but no endCursor; "
+                            "stopping pagination after %d nodes",
+                            len(all_nodes),
+                        )
+                        break
+                    cursor = end_cursor
+                    has_next = True
+
+            _MAX_PAGES -= 1
+            if not has_next or _MAX_PAGES <= 0:
+                break
+
+        return all_nodes
+
+    async def async_get_ledger_balances(self) -> dict:
+        """Fetch ledger balances.
+
+        Returns ``{"electricity": <cents>, "powerpacks": <cents>}``.
+        """
+        data = await self._async_graphql(
+            _Q_LEDGERS, {"acct": self._account_number},
+        )
+        account = data.get("account", {})
+        result = {"electricity": 0, "powerpacks": 0}
+        for ledger in account.get("ledgers") or []:
+            ltype = (ledger.get("ledgerType") or "").upper()
+            balance = ledger.get("balance", 0)
+            if "ELECTRICITY" in ltype:
+                result["electricity"] = balance
+            elif "POWERPACK" in ltype:
+                result["powerpacks"] = balance
+        return result
+
+    async def async_get_generation_total(
+        self,
+        start: datetime,
+        end: datetime,
+    ) -> float:
+        """Fetch total solar export in the date range (kWh)."""
+        nodes = await self.async_get_measurements(
+            start, end, frequency="DAY_INTERVAL", direction="GENERATION",
+        )
+        return sum(float(n.get("value", 0)) for n in nodes)
+
+    async def async_get_billing_info(self) -> dict:
+        """Fetch billing period dates.
+
+        Returns ``{"period_start": "YYYY-MM-DD", "period_end": "YYYY-MM-DD",
+                    "next_billing_date": "YYYY-MM-DD"}``
+        with ``None`` values for any missing fields.
+        """
+        data = await self._async_graphql(
+            _Q_BILLING, {"acct": self._account_number},
+        )
+        opts = data.get("account", {}).get("billingOptions") or {}
+        return {
+            "period_start": opts.get("currentBillingPeriodStartDate"),
+            "period_end": opts.get("currentBillingPeriodEndDate"),
+            "next_billing_date": opts.get("nextBillingDate"),
+        }
+
+    # -- Static helpers for config flow / account discovery -----------------
+
+    @staticmethod
+    async def async_discover_accounts(
+        session: aiohttp.ClientSession,
+        id_token: str,
+        brand: str = DEFAULT_BRAND,
+    ) -> list[dict]:
+        """Query the viewer endpoint to discover all accounts.
+
+        Returns a list of AccountType dicts (number, brand, status, properties).
+        Raises ``AuthError`` or ``ApiError`` on failure.
+        """
+        cfg = BRAND_CONFIG[brand]
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": _BROWSER_UA,
+            "Authorization": id_token,
+            "Origin": cfg["app_origin"],
+            "Referer": f"{cfg['app_origin']}/",
+        }
+        async with session.post(
+            cfg["api_url"],
+            json={"query": _Q_DISCOVER_ACCOUNT},
+            headers=headers,
+        ) as resp:
+            if resp.status in (401, 403):
+                raise AuthError("auth_invalid")
+            if resp.status != 200:
+                body = await resp.text()
+                raise ApiError(f"HTTP {resp.status}: {body[:300]}")
+            try:
+                result = await resp.json()
+            except (ValueError, aiohttp.ContentTypeError) as exc:
+                body = await resp.text()
+                raise ApiError(
+                    f"Invalid JSON response: {body[:300]}"
+                ) from exc
+
+        errors = result.get("errors")
+        if errors:
+            raise ApiError(f"GraphQL errors: {[e.get('message') for e in errors]}")
+
+        accounts = (
+            result.get("data", {}).get("viewer", {}).get("accounts") or []
+        )
+        if not accounts:
+            raise ApiError("no_accounts_found")
+        return accounts
+
+
+# ---------------------------------------------------------------------------
+# GraphQL query strings
+# ---------------------------------------------------------------------------
+
+_Q_DISCOVER_ACCOUNT = """
+{
+  viewer {
+    accounts {
+      ... on AccountType {
+        number brand status
+        properties {
+          id address
+          meterPoints { id marketIdentifier }
+        }
+      }
+    }
+  }
+}
+"""
+
+_Q_ACCOUNT = """
+query($acct: String!) {
+  account(accountNumber: $acct) {
+    ... on AccountType {
+      number brand status balance
+      properties {
+        id address
+        meterPoints {
+          id marketIdentifier
+          activeAgreement {
+            id validFrom validTo
+            product { code fullName }
+            rates {
+              touBucketName label unitType bandCategory
+              rateIncludingTax rateExcludingTax
+            }
+            timeOfUseSchemes {
+              name
+              timeslots {
+                timeslot activeFrom activeTo
+                weekdays weekends
+              }
+            }
+          }
+          registers {
+            identifier meterSerial isFeedIn
+          }
+        }
+      }
+      ledgers { name ledgerType balance }
+    }
+  }
+}
+"""
+
+_Q_RATES_TOU = """
+query($acct: String!) {
+  account(accountNumber: $acct) {
+    ... on AccountType {
+      properties {
+        meterPoints {
+          activeAgreement {
+            product { code fullName }
+            rates {
+              touBucketName label unitType bandCategory
+              rateIncludingTax rateExcludingTax
+            }
+            timeOfUseSchemes {
+              name
+              timeslots {
+                timeslot activeFrom activeTo
+                weekdays weekends
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
+_Q_MEASUREMENTS = """
+query($acct: String!, $start: DateTime!, $end: DateTime!, $first: Int!, $after: String) {{
+  account(accountNumber: $acct) {{
+    ... on AccountType {{
+      properties {{
+        measurements(
+          startAt: $start
+          endAt: $end
+          timezone: "Pacific/Auckland"
+          utilityFilters: [{{ electricityFilters: {{
+            readingDirection: {direction}
+            readingFrequencyType: {frequency}
+          }}}}]
+          first: $first
+          after: $after
+        ) {{
+          totalCount
+          pageInfo {{ hasNextPage endCursor }}
+          edges {{ node {{ ... on IntervalMeasurementType {{
+            value unit startAt endAt
+            metaData {{ statistics {{ label value costInclTax {{ estimatedAmount }} }} }}
+          }}}}}}
+        }}
+      }}
+    }}
+  }}
+}}
+"""
+
+_Q_DAILY_COSTS = """
+query($acct: String!, $start: DateTime!, $end: DateTime!, $first: Int!, $after: String) {
+  account(accountNumber: $acct) {
+    ... on AccountType {
+      properties {
+        measurements(
+          startAt: $start
+          endAt: $end
+          timezone: "Pacific/Auckland"
+          utilityFilters: [{ electricityFilters: {
+            readingDirection: CONSUMPTION
+            readingFrequencyType: DAY_INTERVAL
+          }}]
+          first: $first
+          after: $after
+        ) {
+          totalCount
+          pageInfo { hasNextPage endCursor }
+          edges { node { ... on IntervalMeasurementType {
+            value unit startAt endAt
+            metaData {
+              statistics {
+                label
+                value
+                costInclTax { estimatedAmount }
+              }
+            }
+          }}}
+        }
+      }
+    }
+  }
+}
+"""
+
+_Q_LEDGERS = """
+query($acct: String!) {
+  account(accountNumber: $acct) {
+    ... on AccountType {
+      ledgers { name ledgerType balance }
+    }
+  }
+}
+"""
+
+_Q_BILLING = """
+query($acct: String!) {
+  account(accountNumber: $acct) {
+    ... on AccountType {
+      billingOptions {
+        currentBillingPeriodStartDate
+        currentBillingPeriodEndDate
+        nextBillingDate
+      }
+    }
+  }
+}
+"""

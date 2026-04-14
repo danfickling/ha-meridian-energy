@@ -2,74 +2,82 @@
   "config": {
     "step": {
       "user": {
-        "title": "Energy Account Login",
-        "description": "Select your electricity supplier and enter your account credentials.",
+        "title": "Energy Account",
+        "description": "Select your electricity provider and enter your email address. A verification code will be sent to your email.",
         "data": {
-          "supplier": "Supplier",
-          "network": "Network region",
-          "email": "Email address",
-          "password": "Password",
-          "history_start": "History start date",
-          "cookie": "Browser cookie (optional)"
-        },
-        "data_description": {
-          "supplier": "Choose your electricity supplier. Both Powershop and Meridian Energy portals are supported.",
-          "network": "The electricity network your property is connected to. This determines the TOU (time-of-use) schedule boundaries.",
-          "history_start": "Start date for historical data import in DD/MM/YYYY format (e.g. 01/06/2023). Leave empty for a rolling 365-day window.",
-          "cookie": "Optional: paste the Cookie header from your browser (DevTools > Network tab) to bypass captcha or 2FA. Leave empty for normal login."
+          "brand": "Provider",
+          "email": "Email address"
+        }
+      },
+      "otp": {
+        "title": "Verification",
+        "description": "A verification code has been sent to **{email}**. Enter the 6-digit code from the email below.",
+        "data": {
+          "otp": "Verification code"
+        }
+      },
+      "select_account": {
+        "title": "Select Account",
+        "description": "Multiple accounts were found. Please select the account to configure.",
+        "data": {
+          "account": "Account"
         }
       },
       "reauth_confirm": {
         "title": "Re-authenticate",
-        "description": "Your {supplier} credentials have expired or are invalid. Please re-enter them.",
+        "description": "Your {brand} session has expired. Press Submit to send a new verification code to **{email}**."
+      },
+      "reauth_otp": {
+        "title": "Re-authenticate \u2014 Verification",
+        "description": "Enter the verification code from the email sent to **{email}**.",
         "data": {
-          "email": "Email address",
-          "password": "Password",
-          "cookie": "Browser cookie (optional)"
+          "otp": "Verification code"
+        }
+      },
+      "reconfigure": {
+        "title": "Reconfigure Account",
+        "description": "Change the email address, provider, or account for this integration. A new verification code will be sent.",
+        "data": {
+          "brand": "Provider",
+          "email": "Email address"
+        }
+      },
+      "reconfigure_otp": {
+        "title": "Reconfigure \u2014 Verification",
+        "description": "A verification code has been sent to **{email}**. Enter the code below.",
+        "data": {
+          "otp": "Verification code"
+        }
+      },
+      "reconfigure_select_account": {
+        "title": "Reconfigure \u2014 Select Account",
+        "description": "Multiple accounts were found. Select the account to use.",
+        "data": {
+          "account": "Account"
         }
       }
     },
     "error": {
-      "invalid_auth": "Invalid credentials — login failed. Please check your email, password and supplier selection.",
-      "cannot_connect": "Unable to connect to the supplier portal. Please try again later.",
-      "invalid_date": "Invalid date format — please enter a date in DD/MM/YYYY format (e.g. 01/06/2023)."
+      "invalid_otp": "Invalid or expired code. Please try again.",
+      "email_not_found": "No account found for this email address.",
+      "cannot_connect": "Unable to connect to the provider. Please try again later.",
+      "account_not_found": "Could not find an electricity account. Please check your email address."
     },
     "abort": {
       "already_configured": "This account is already configured.",
-      "reauth_successful": "Re-authentication was successful."
+      "reauth_successful": "Re-authentication was successful.",
+      "reconfigure_successful": "Account reconfigured successfully."
     }
   },
-  "options": {
-    "step": {
-      "init": {
-        "title": "Supplier & Network",
-        "description": "Choose your electricity supplier and network region.",
-        "data": {
-          "supplier": "Supplier",
-          "network": "Network region"
-        },
-        "data_description": {
-          "supplier": "Change your electricity supplier portal. This changes which website the integration logs into.",
-          "network": "Change your electricity network region. If the TOU schedule is different, a new schedule entry will be added while historical data keeps the old boundaries."
-        }
-      },
-      "rates": {
-        "title": "Rates & History",
-        "description": "Configure rate type, historical data range, and authentication.",
-        "data": {
-          "rate_type": "Rate type",
-          "history_start": "History start date",
-          "cookie": "Browser cookie (optional)"
-        },
-        "data_description": {
-          "rate_type": "Choose 'Special' for discount rates or 'Base' for standard rates.",
-          "history_start": "Start date for historical data import in DD/MM/YYYY format (e.g. 01/06/2023). Leave empty for a rolling 365-day window.",
-          "cookie": "Optional: paste the Cookie header from your browser to bypass captcha or 2FA. The cookie will be tried first; if expired, normal login is used as fallback."
-        }
-      }
+
+  "issues": {
+    "stale_usage_data": {
+      "title": "{sensor_name}: Usage data is stale",
+      "description": "The latest usage data from {sensor_name} is {hours_ago} hours old. This may indicate an issue with the provider's API. The integration will continue retrying automatically. If this persists, try using the **Backfill** service to re-fetch recent data."
     },
-    "error": {
-      "invalid_date": "Invalid date format — please enter a date in DD/MM/YYYY format (e.g. 01/06/2023)."
+    "v1_migration_required": {
+      "title": "Re-authentication required after upgrade",
+      "description": "The Meridian Energy integration has been upgraded from v1 to v2, which uses a new authentication method. Please remove and re-add the integration to authenticate with the new OTP (email verification code) flow."
     }
   }
 }

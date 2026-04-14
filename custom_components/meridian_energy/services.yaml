@@ -1,52 +1,30 @@
 refresh_rates:
   name: Refresh rates
   description: >-
-    Force a fresh scrape of the supplier's rates page, updating the
-    rate cache regardless of the weekly refresh schedule.
+    Force an immediate refresh of electricity rates and TOU schedule
+    from the provider's API, bypassing the 24-hour cache.
 
-reimport_history:
-  name: Reimport history
+backfill:
+  name: Backfill statistics
   description: >-
-    Re-download and reprocess all historical usage data from your
-    supplier. This triggers a full CSV download and republishes all
-    external statistics.
-
-check_schedule:
-  name: Check TOU schedule
-  description: >-
-    Check the supplier's TOU schedule page for any changes to your
-    network's time-of-use boundaries. If the schedule has changed,
-    a persistent notification will be created alerting you to verify
-    and update boundaries if needed.
-
-update_schedule:
-  name: Update TOU schedule
-  description: >-
-    Update the TOU schedule boundaries. The new schedule takes effect
-    immediately for live classification. Historical data retains the
-    boundaries that were active at the time.
+    Re-fetch and re-publish energy statistics from a specific date.
+    Use this to fill gaps (e.g. after a long outage) or to pick up
+    data that became available after initial processing.
   fields:
-    night_start:
-      name: Night start
-      description: "Start of night period (HH:MM), e.g. '22:00'. Omit for networks without a night rate."
-      example: "22:00"
+    start_date:
+      name: Start date
+      description: The date to start backfilling from (YYYY-MM-DD).
+      required: true
+      example: "2026-04-01"
       selector:
-        text:
-    night_end:
-      name: Night end
-      description: "End of night period (HH:MM), e.g. '07:00'. Omit for networks without a night rate."
-      example: "07:00"
+        date:
+    end_date:
+      name: End date
+      description: >-
+        The end date for the backfill range (YYYY-MM-DD).
+        Defaults to today if not specified. The fetch always
+        extends to now to keep cumulative sums consistent.
+      required: false
+      example: "2026-04-10"
       selector:
-        text:
-    peak_weekday:
-      name: Weekday peak periods
-      description: "List of [start, end] pairs for weekday peak, e.g. [['07:00','09:30'],['17:30','20:00']]"
-      example: "[['07:00','09:30'],['17:30','20:00']]"
-      selector:
-        object:
-    weekend_offpeak:
-      name: Weekend off-peak
-      description: "When enabled, the entire weekend (outside night) is classified as off-peak instead of using the weekday peak windows."
-      default: false
-      selector:
-        boolean:
+        date:

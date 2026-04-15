@@ -482,7 +482,7 @@ class TestSeedFromLatest:
         with patch("meridian_energy.coordinator.get_instance", return_value=recorder_mock), \
              patch("meridian_energy.coordinator.get_last_statistics",
                    side_effect=self._mock_get_last_statistics(db)):
-            result = self._run(coord._async_seed_from_latest(stat_ids))
+            result, last_states = self._run(coord._async_seed_from_latest(stat_ids))
 
         assert coord._energy_sums["night"] == 6368.16
         assert coord._cost_sums["night"] == 1155.63
@@ -503,12 +503,13 @@ class TestSeedFromLatest:
         stat_ids = [f"{DOMAIN}:consumption_night", f"{DOMAIN}:cost_night"]
         with patch("meridian_energy.coordinator.get_instance", return_value=recorder_mock), \
              patch("meridian_energy.coordinator.get_last_statistics", return_value={}):
-            result = self._run(coord._async_seed_from_latest(stat_ids))
+            result, last_states = self._run(coord._async_seed_from_latest(stat_ids))
 
         assert coord._energy_sums["night"] == 0.0
         assert coord._cost_sums["night"] == 0.0
         # Empty DB → no skip timestamps
         assert result == {}
+        assert last_states == {}
 
     def test_seeds_from_latest_entry(self):
         """Seeding uses the latest DB entry (not a specific api_start)."""
@@ -530,7 +531,7 @@ class TestSeedFromLatest:
         with patch("meridian_energy.coordinator.get_instance", return_value=recorder_mock), \
              patch("meridian_energy.coordinator.get_last_statistics",
                    side_effect=self._mock_get_last_statistics(db)):
-            result = self._run(coord._async_seed_from_latest(stat_ids))
+            result, last_states = self._run(coord._async_seed_from_latest(stat_ids))
 
         # Should seed from Apr 9 (latest entry)
         assert coord._energy_sums["night"] == 6378.82
@@ -646,7 +647,10 @@ class TestHourlyConsumptionStats:
         assert len(calls) == 4
 
     def test_skip_before_prevents_recount(self):
-        """Entries at-or-before skip_before are not counted."""
+        """The boundary hour is re-aggregated (< not <=); entries
+        strictly before skip_before are skipped.  Caller must adjust
+        the seed sum by subtracting the last state first.
+        """
         coord = _make_coordinator(
             rates={"night": 0.2362},
             schedule=self._make_schedule(),
@@ -660,12 +664,14 @@ class TestHourlyConsumptionStats:
             coord._publish_hourly_consumption_stats([node_a])
             assert abs(coord._energy_sums["night"] - 0.5) < 1e-9
 
-            # Re-seed sums (as DB would), then call with skip_before
-            coord._energy_sums["night"] = 0.5
+            # Simulate adjusted seed: sum - state (as the caller does)
+            coord._energy_sums["night"] = 0.5 - 0.5  # 0.0
+            coord._cost_sums["night"] = 0.0
             skip = datetime(2026, 1, 5, 0, 0, tzinfo=NZ_TZ)
             coord._publish_hourly_consumption_stats(
                 [node_a, node_b], skip_before=skip,
             )
+            # node_a re-aggregated (0.5) + node_b (0.3) = 0.8
             assert abs(coord._energy_sums["night"] - 0.8) < 1e-9
 
     def test_seeded_sums_continue(self):

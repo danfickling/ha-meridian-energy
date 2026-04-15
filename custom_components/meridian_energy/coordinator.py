@@ -233,7 +233,7 @@ class MeridianCoordinator(DataUpdateCoordinator[MeridianData]):
             set(all_stat_ids),
             "hour",
             None,
-            {"sum"},
+            {"sum", "state"},
         )
 
         self._energy_sums.clear()
@@ -242,15 +242,19 @@ class MeridianCoordinator(DataUpdateCoordinator[MeridianData]):
         self._solar_sum = 0.0
 
         seed_skip: datetime | None = None
+        last_backfill_states: dict[str, float] = {}
         for stat_id, entries in seed_result.items():
             if not entries:
                 continue
             last = entries[-1]
             seed_sum = last.get("sum") or 0.0
+            seed_state = last.get("state") or 0.0
             entry_ts = last.get("start", 0.0)
             ts = datetime.fromtimestamp(entry_ts, tz=NZ_TZ)
             if seed_skip is None or ts > seed_skip:
                 seed_skip = ts
+
+            last_backfill_states[stat_id] = seed_state
 
             if stat_id == f"{DOMAIN}:return_to_grid":
                 self._solar_sum = seed_sum
@@ -292,8 +296,9 @@ class MeridianCoordinator(DataUpdateCoordinator[MeridianData]):
         except (AuthError, ApiError, aiohttp.ClientError) as err:
             _LOGGER.debug("Backfill: half-hourly fetch failed: %s", err)
 
-        # Use seed_skip so entries at-or-before the seed point are NOT
-        # overwritten (preserves historical data before the backfill).
+        # Use seed_skip so entries strictly before the seed point are
+        # skipped (preserves historical data before the backfill).
+        # The entry at seed_skip itself is re-aggregated (< not <=).
         skip = seed_skip
 
         # -- Publish ---------------------------------------------------
@@ -301,6 +306,32 @@ class MeridianCoordinator(DataUpdateCoordinator[MeridianData]):
         # meter reads in long-term statistics.
         now = datetime.now(NZ_TZ)
         if half_hourly_nodes:
+            # Adjust sums for the boundary hour (same logic as the
+            # regular poll in _async_fetch_and_publish_stats).
+            if skip is not None:
+                for sid, entries in seed_result.items():
+                    if not entries:
+                        continue
+                    entry_ts = entries[-1].get("start", 0.0)
+                    ts = datetime.fromtimestamp(entry_ts, tz=NZ_TZ)
+                    if ts != skip:
+                        continue
+                    state = last_backfill_states.get(sid, 0.0)
+                    if (
+                        sid.startswith(f"{DOMAIN}:consumption_")
+                        and sid != f"{DOMAIN}:consumption_daily_charge"
+                    ):
+                        period = sid.removeprefix(
+                            f"{DOMAIN}:consumption_",
+                        )
+                        self._energy_sums[period] -= state
+                    elif (
+                        sid.startswith(f"{DOMAIN}:cost_")
+                        and sid != f"{DOMAIN}:cost_daily_charge"
+                    ):
+                        period = sid.removeprefix(f"{DOMAIN}:cost_")
+                        self._cost_sums[period] -= state
+
             self._publish_hourly_consumption_stats(
                 half_hourly_nodes,
                 skip_before=skip,
@@ -538,31 +569,41 @@ class MeridianCoordinator(DataUpdateCoordinator[MeridianData]):
     async def _async_seed_from_latest(
         self,
         stat_ids: list[str],
-    ) -> dict[str, datetime]:
+    ) -> tuple[dict[str, datetime], dict[str, float]]:
         """Seed cumulative sums from the latest DB entry per stat ID.
 
-        Returns a dict mapping each stat ID that has existing data to
-        its latest entry's NZ-aware timestamp.  Callers use these
-        timestamps as *skip_before* boundaries so that existing DB
-        entries are never overwritten — only genuinely new data (after
-        the latest entry) is published.
+        Returns a tuple of:
 
-        Fresh installs return an empty dict (no skip).
+        * *latest_map* – dict mapping each stat ID with existing data to
+          its latest entry's NZ-aware timestamp.
+        * *last_states* – dict mapping each stat ID to the ``state``
+          (non-cumulative value) of its latest entry.
+
+        Callers use *latest_map* timestamps to derive *skip_before*
+        boundaries and *last_states* to adjust cumulative sums before
+        re-processing the boundary entry (so partial hours can be
+        completed without double-counting).
+
+        Fresh installs return empty dicts (no skip).
         """
         recorder = get_instance(self.hass)
         latest_map: dict[str, datetime] = {}
+        last_states: dict[str, float] = {}
 
         for stat_id in stat_ids:
             last = await recorder.async_add_executor_job(
                 get_last_statistics, self.hass, 1, stat_id, False,
-                {"sum"},
+                {"sum", "state"},
             )
             if stat_id not in last or not last[stat_id]:
                 continue
 
             entry = last[stat_id][0]
             seed_sum = entry.get("sum") or 0.0
+            seed_state = entry.get("state") or 0.0
             entry_ts = entry.get("start", 0.0)
+
+            last_states[stat_id] = seed_state
 
             if stat_id == f"{DOMAIN}:return_to_grid":
                 self._solar_sum = seed_sum
@@ -590,7 +631,7 @@ class MeridianCoordinator(DataUpdateCoordinator[MeridianData]):
             self._daily_charge_sum,
             self._solar_sum,
         )
-        return latest_map
+        return latest_map, last_states
 
     async def _async_fetch_and_publish_stats(self) -> dict:
         """Fetch measurements and publish external statistics.
@@ -600,8 +641,9 @@ class MeridianCoordinator(DataUpdateCoordinator[MeridianData]):
         the daily charge stat and cost sensor, and solar generation data.
 
         Every poll seeds cumulative sums from the database, fetches
-        API data with overlap, skips entries at-or-before the last
-        known timestamp, and publishes only new entries.  The
+        API data with overlap, skips entries strictly before the last
+        known timestamp (allowing the last entry to be re-aggregated
+        with updated data), and publishes new entries.  The
         ``async_add_external_statistics`` API performs upserts, so
         re-publishing the same timestamp is safe.
         """
@@ -615,7 +657,7 @@ class MeridianCoordinator(DataUpdateCoordinator[MeridianData]):
         all_stat_ids.append(f"{DOMAIN}:return_to_grid")
         all_stat_ids.append(f"{DOMAIN}:cost_daily_charge")
         all_stat_ids.append(f"{DOMAIN}:consumption_daily_charge")
-        latest_map = await self._async_seed_from_latest(all_stat_ids)
+        latest_map, last_states = await self._async_seed_from_latest(all_stat_ids)
 
         # Derive per-category skip boundaries
         consumption_ts = [
@@ -711,6 +753,31 @@ class MeridianCoordinator(DataUpdateCoordinator[MeridianData]):
                                     now=now,
                                 )
 
+                # Adjust cumulative sums for the boundary hour that
+                # will be re-aggregated (< instead of <=).  Only
+                # subtract the last state for stat IDs whose latest
+                # entry IS at energy_skip — periods with earlier
+                # latest entries keep their full sums.
+                if energy_skip is not None:
+                    for sid, ts in latest_map.items():
+                        if ts != energy_skip:
+                            continue
+                        state = last_states.get(sid, 0.0)
+                        if (
+                            sid.startswith(f"{DOMAIN}:consumption_")
+                            and sid != f"{DOMAIN}:consumption_daily_charge"
+                        ):
+                            period = sid.removeprefix(
+                                f"{DOMAIN}:consumption_",
+                            )
+                            self._energy_sums[period] -= state
+                        elif (
+                            sid.startswith(f"{DOMAIN}:cost_")
+                            and sid != f"{DOMAIN}:cost_daily_charge"
+                        ):
+                            period = sid.removeprefix(f"{DOMAIN}:cost_")
+                            self._cost_sums[period] -= state
+
                 self._publish_hourly_consumption_stats(
                     half_hourly_nodes,
                     skip_before=energy_skip,
@@ -784,8 +851,10 @@ class MeridianCoordinator(DataUpdateCoordinator[MeridianData]):
         Falls back to schedule-based ``classify_period()`` only when
         a node has no metadata statistics.
 
-        When *skip_before* is set, entries at or before that timestamp
-        are skipped (already in DB).
+        When *skip_before* is set, entries strictly before that
+        timestamp are skipped.  The entry at *skip_before* itself is
+        always re-aggregated so that partial hours (only one of two
+        half-hourly nodes) can be completed on the next poll.
 
         When *skip_estimated* is True (default), nodes whose ``value``
         has too many significant decimal digits are skipped because
@@ -836,8 +905,11 @@ class MeridianCoordinator(DataUpdateCoordinator[MeridianData]):
                 period_entries = [(period, kwh, kwh * rate)]
 
             for period, kwh, cost in period_entries:
-                # Skip data that already exists in DB.
-                if skip_before is not None and hour_start <= skip_before:
+                # Skip data that already exists in DB, but allow
+                # the skip_before hour itself to be re-aggregated
+                # so partial hours (missing the :30 half-hour) can
+                # be completed on the next poll.
+                if skip_before is not None and hour_start < skip_before:
                     continue
 
                 hourly_agg[period][hour_start][0] += kwh

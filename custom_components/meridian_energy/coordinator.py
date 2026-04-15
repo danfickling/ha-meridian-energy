@@ -228,7 +228,7 @@ class MeridianCoordinator(DataUpdateCoordinator[MeridianData]):
         seed_result: dict[str, list] = await recorder.async_add_executor_job(
             statistics_during_period,
             self.hass,
-            None,
+            start_dt - timedelta(days=7),
             start_dt,
             set(all_stat_ids),
             "hour",

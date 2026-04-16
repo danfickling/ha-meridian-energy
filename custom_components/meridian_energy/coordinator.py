@@ -46,9 +46,10 @@ from .const import (
     BRAND_CONFIG,
     DEFAULT_BRAND,
     DEFAULT_LOOKBACK_DAYS,
-    ESTIMATE_PRECISION_THRESHOLD,
+    ESTIMATED_DAYS,
     PERIOD_CONTROLLED,
     PERIOD_OFFPEAK,
+    RECONCILIATION_DAYS,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -60,18 +61,24 @@ NZ_TZ = ZoneInfo("Pacific/Auckland")
 STALE_DATA_THRESHOLD = timedelta(hours=48)
 
 
-def _is_estimated_value(value_str: str) -> bool:
-    """Return True if a measurement value appears to be estimated.
+def _is_estimated_data(start_str: str, now: datetime | None = None) -> bool:
+    """Return True if a measurement is considered estimated (too recent).
 
-    Actual meter reads have ≤ ``ESTIMATE_PRECISION_THRESHOLD`` significant
-    decimal digits (e.g. ``"24.854000000000000000"`` → 3).  Estimated /
-    interpolated values from the API have many more (e.g. 26–28 digits
-    like ``"21.28208437045405498041797199"``).
+    The Kraken API provides no explicit estimated flag.  The Powershop
+    app treats today's and yesterday's data as estimated because smart
+    meter reads go through a reconciliation process that typically takes
+    two days.  We replicate that heuristic here.
     """
-    if not isinstance(value_str, str) or "." not in value_str:
-        return False
-    decimal_part = value_str.split(".")[1].rstrip("0")
-    return len(decimal_part) > ESTIMATE_PRECISION_THRESHOLD
+    if not start_str:
+        return True
+    try:
+        ts = datetime.fromisoformat(start_str)
+    except (ValueError, TypeError):
+        return True
+    ref = (now or datetime.now(NZ_TZ)).astimezone(NZ_TZ)
+    cutoff = (ref.replace(hour=0, minute=0, second=0, microsecond=0)
+              - timedelta(days=ESTIMATED_DAYS - 1))
+    return ts.astimezone(NZ_TZ) >= cutoff
 
 
 def _energy_stat_id(period: str) -> str:
@@ -184,15 +191,69 @@ class MeridianCoordinator(DataUpdateCoordinator[MeridianData]):
         self._last_rates_refresh = None
         await self.async_refresh()
 
+    async def _async_delete_statistics_range(
+        self,
+        start: datetime,
+        end: datetime,
+    ) -> int:
+        """Delete all meridian_energy statistics rows in [start, end).
+
+        Removes entries from both ``statistics`` and
+        ``statistics_short_term`` so that a subsequent backfill can
+        re-publish clean data without stale rows lingering.
+        """
+        from sqlalchemy import text  # noqa: C0415
+
+        recorder = get_instance(self.hass)
+        start_ts = start.timestamp()
+        end_ts = end.timestamp()
+        prefix = f"{DOMAIN}:%"
+
+        def _do_delete() -> int:
+            with recorder.engine.begin() as conn:
+                meta_rows = conn.execute(
+                    text(
+                        "SELECT id FROM statistics_meta"
+                        " WHERE statistic_id LIKE :prefix"
+                    ),
+                    {"prefix": prefix},
+                ).fetchall()
+                if not meta_rows:
+                    return 0
+                meta_ids = ", ".join(str(r[0]) for r in meta_rows)
+                total = 0
+                for table in ("statistics", "statistics_short_term"):
+                    result = conn.execute(
+                        text(
+                            f"DELETE FROM {table}"
+                            f" WHERE metadata_id IN ({meta_ids})"
+                            " AND start_ts >= :start_ts"
+                            " AND start_ts < :end_ts"
+                        ),
+                        {"start_ts": start_ts, "end_ts": end_ts},
+                    )
+                    total += result.rowcount
+                return total
+
+        deleted = await recorder.async_add_executor_job(_do_delete)
+        if deleted:
+            _LOGGER.info(
+                "Backfill: deleted %d existing statistics rows in %s – %s",
+                deleted,
+                start.date(),
+                end.date(),
+            )
+        return deleted
+
     async def async_backfill(
         self, start_date: date, end_date: date | None = None,
     ) -> None:
         """Re-fetch and re-publish statistics from *start_date*.
 
-        Seeds cumulative sums from the DB entry just before
-        *start_date*, fetches API data from *start_date* to now,
-        and re-publishes all statistics — overwriting any existing
-        entries in that range so that cumulative sums are correct.
+        Deletes existing statistics in the date range first, seeds
+        cumulative sums from the DB entry just before *start_date*,
+        fetches API data from *start_date* to now, and re-publishes
+        all statistics so that cumulative sums are correct.
         """
         now = datetime.now(NZ_TZ)
         end_date = end_date or now.date()
@@ -209,6 +270,10 @@ class MeridianCoordinator(DataUpdateCoordinator[MeridianData]):
             ),
             now,
         )
+
+        # Delete existing statistics in the backfill range so stale or
+        # estimated data is removed before re-publishing.
+        await self._async_delete_statistics_range(start_dt, fetch_end)
 
         # Refresh rates first so _daily_charge and _rate_to_period
         # are populated for the publish methods.
@@ -641,9 +706,11 @@ class MeridianCoordinator(DataUpdateCoordinator[MeridianData]):
         the daily charge stat and cost sensor, and solar generation data.
 
         Every poll seeds cumulative sums from the database, fetches
-        API data with overlap, skips entries strictly before the last
-        known timestamp (allowing the last entry to be re-aggregated
-        with updated data), and publishes new entries.  The
+        API data with a ``ESTIMATED_DAYS + RECONCILIATION_DAYS`` day
+        overlap, skips estimated data (within ``ESTIMATED_DAYS``), and
+        re-processes the reconciliation window so that data which was
+        initially published from estimated API values is corrected once
+        actual meter reads are available.  The
         ``async_add_external_statistics`` API performs upserts, so
         re-publishing the same timestamp is safe.
         """
@@ -675,12 +742,15 @@ class MeridianCoordinator(DataUpdateCoordinator[MeridianData]):
         solar_skip = latest_map.get(f"{DOMAIN}:return_to_grid")
 
         # Determine fetch window from the latest known timestamp.
-        # Use a 3-day overlap because actual (non-estimated) data can
-        # take up to ~2 days to appear after the measurement period.
+        # Fetch ESTIMATED_DAYS + RECONCILIATION_DAYS worth of overlap
+        # so that data which recently passed the estimated threshold
+        # can be re-checked and upserted with actual values.
         all_ts = [t for t in latest_map.values() if t is not None]
         latest_ts = max(all_ts) if all_ts else None
         if latest_ts is not None:
-            start = latest_ts - timedelta(days=3)
+            start = latest_ts - timedelta(
+                days=ESTIMATED_DAYS + RECONCILIATION_DAYS,
+            )
         else:
             start = now - timedelta(days=DEFAULT_LOOKBACK_DAYS)
 
@@ -710,8 +780,8 @@ class MeridianCoordinator(DataUpdateCoordinator[MeridianData]):
             _LOGGER.debug("Half-hourly measurements unavailable: %s", err)
 
         # Estimated data filtering: each publish method checks individual
-        # node values via _is_estimated_value() to skip estimated data
-        # (high decimal precision) and only publish actual meter reads.
+        # node timestamps via _is_estimated_data() to skip recent data
+        # that hasn't been through meter reconciliation yet.
 
         if daily_nodes or half_hourly_nodes:
             # Per-period energy/cost: hourly resolution from half-hourly
@@ -753,30 +823,59 @@ class MeridianCoordinator(DataUpdateCoordinator[MeridianData]):
                                     now=now,
                                 )
 
-                # Adjust cumulative sums for the boundary hour that
-                # will be re-aggregated (< instead of <=).  Only
-                # subtract the last state for stat IDs whose latest
-                # entry IS at energy_skip — periods with earlier
-                # latest entries keep their full sums.
+                # Reconciliation: push skip boundary back by
+                # RECONCILIATION_DAYS so that data which recently
+                # cleared the ESTIMATED_DAYS threshold gets
+                # re-processed and upserted with actual values.
+                # This replaces the simpler boundary-hour adjustment
+                # and ensures stale estimated data is corrected once
+                # the API provides reconciled reads.
                 if energy_skip is not None:
-                    for sid, ts in latest_map.items():
-                        if ts != energy_skip:
-                            continue
-                        state = last_states.get(sid, 0.0)
+                    recon_start = energy_skip - timedelta(
+                        days=RECONCILIATION_DAYS,
+                    )
+                    recon_ids = set(
+                        sid for sid in latest_map
                         if (
                             sid.startswith(f"{DOMAIN}:consumption_")
-                            and sid != f"{DOMAIN}:consumption_daily_charge"
-                        ):
-                            period = sid.removeprefix(
-                                f"{DOMAIN}:consumption_",
+                            or sid.startswith(f"{DOMAIN}:cost_")
+                        )
+                        and "daily_charge" not in sid
+                    )
+                    if recon_ids:
+                        recorder = get_instance(self.hass)
+                        recon_entries = (
+                            await recorder.async_add_executor_job(
+                                statistics_during_period,
+                                self.hass,
+                                recon_start,
+                                energy_skip + timedelta(hours=1),
+                                recon_ids,
+                                "hour",
+                                None,
+                                {"state"},
                             )
-                            self._energy_sums[period] -= state
-                        elif (
-                            sid.startswith(f"{DOMAIN}:cost_")
-                            and sid != f"{DOMAIN}:cost_daily_charge"
-                        ):
-                            period = sid.removeprefix(f"{DOMAIN}:cost_")
-                            self._cost_sums[period] -= state
+                        )
+                        for sid, entries in recon_entries.items():
+                            total = sum(
+                                e.get("state") or 0.0
+                                for e in entries
+                            )
+                            if sid.startswith(
+                                f"{DOMAIN}:consumption_",
+                            ):
+                                period = sid.removeprefix(
+                                    f"{DOMAIN}:consumption_",
+                                )
+                                self._energy_sums[period] -= total
+                            elif sid.startswith(
+                                f"{DOMAIN}:cost_",
+                            ):
+                                period = sid.removeprefix(
+                                    f"{DOMAIN}:cost_",
+                                )
+                                self._cost_sums[period] -= total
+                    energy_skip = recon_start
 
                 self._publish_hourly_consumption_stats(
                     half_hourly_nodes,
@@ -856,9 +955,9 @@ class MeridianCoordinator(DataUpdateCoordinator[MeridianData]):
         always re-aggregated so that partial hours (only one of two
         half-hourly nodes) can be completed on the next poll.
 
-        When *skip_estimated* is True (default), nodes whose ``value``
-        has too many significant decimal digits are skipped because
-        they are API estimates rather than actual meter reads.
+        When *skip_estimated* is True (default), nodes whose timestamp
+        falls within the last ``ESTIMATED_DAYS`` days are skipped because
+        recent data hasn't been through meter reconciliation yet.
         """
 
         sorted_nodes = sorted(nodes, key=lambda n: n.get("startAt", ""))
@@ -882,8 +981,8 @@ class MeridianCoordinator(DataUpdateCoordinator[MeridianData]):
             if now is not None and hour_start > now:
                 continue
 
-            # Skip estimated data (high decimal precision = not a real meter read).
-            if skip_estimated and _is_estimated_value(str(node.get("value", ""))):
+            # Skip estimated data (too recent for meter reconciliation).
+            if skip_estimated and _is_estimated_data(start_str, now):
                 continue
 
             # Try to extract per-period breakdown from metadata stats.
@@ -1012,9 +1111,9 @@ class MeridianCoordinator(DataUpdateCoordinator[MeridianData]):
         When *skip_before* is set, entries at or before that timestamp
         are skipped (already in DB).
 
-        When *skip_estimated* is True (default), nodes whose ``value``
-        has too many significant decimal digits are skipped because
-        they are API estimates rather than actual meter reads.
+        When *skip_estimated* is True (default), nodes whose timestamp
+        falls within the last ``ESTIMATED_DAYS`` days are skipped because
+        recent data hasn't been through meter reconciliation yet.
         """
 
         sorted_nodes = sorted(nodes, key=lambda n: n.get("startAt", ""))
@@ -1037,8 +1136,8 @@ class MeridianCoordinator(DataUpdateCoordinator[MeridianData]):
             if now is not None and ts > now:
                 continue
 
-            # Skip estimated data (high decimal precision = not a real meter read).
-            if skip_estimated and _is_estimated_value(str(node.get("value", ""))):
+            # Skip estimated data (too recent for meter reconciliation).
+            if skip_estimated and _is_estimated_data(start_str, now):
                 continue
 
             for stat in (
@@ -1133,9 +1232,9 @@ class MeridianCoordinator(DataUpdateCoordinator[MeridianData]):
         When *skip_before* is set, skip API nodes whose date falls
         at or before that timestamp (already in DB).
 
-        When *skip_estimated* is True (default), nodes whose ``value``
-        has too many significant decimal digits are skipped because
-        they are API estimates rather than actual meter reads.
+        When *skip_estimated* is True (default), nodes whose timestamp
+        falls within the last ``ESTIMATED_DAYS`` days are skipped because
+        recent data hasn't been through meter reconciliation yet.
         The latest daily cost for the balance sensor is still cached
         from all nodes regardless.
         """
@@ -1161,8 +1260,8 @@ class MeridianCoordinator(DataUpdateCoordinator[MeridianData]):
             if now is not None and ts > now:
                 continue
 
-            # Skip estimated data (high decimal precision = not a real meter read).
-            if skip_estimated and _is_estimated_value(str(node.get("value", ""))):
+            # Skip estimated data (too recent for meter reconciliation).
+            if skip_estimated and _is_estimated_data(start_str, now):
                 continue
 
             # Skip dates that already have entries in the DB
@@ -1280,8 +1379,8 @@ class MeridianCoordinator(DataUpdateCoordinator[MeridianData]):
             if now is not None and ts > now:
                 continue
 
-            # Skip estimated data (high decimal precision = not a real meter read).
-            if skip_estimated and _is_estimated_value(str(node.get("value", ""))):
+            # Skip estimated data (too recent for meter reconciliation).
+            if skip_estimated and _is_estimated_data(start_str, now):
                 continue
 
             if skip_before is not None and ts <= skip_before:

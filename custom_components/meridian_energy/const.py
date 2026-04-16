@@ -81,9 +81,14 @@ PERIOD_DISPLAY_NAMES: dict[str, str] = {
 # Only used on first setup; subsequent polls resume incrementally.
 DEFAULT_LOOKBACK_DAYS = 3650
 
-# Actual meter reads from the API have ≤ this many significant
-# decimal digits (e.g. "24.854000000000000000" → 3).  Estimated /
-# interpolated values have many more (e.g. 26–28 digits).  We use
-# this threshold to detect and skip estimated data so that only
-# actual meter reads appear in the energy dashboard statistics.
-ESTIMATE_PRECISION_THRESHOLD = 3
+# How many days of recent data to treat as estimated.
+# The Kraken API provides no explicit flag; the Powershop app treats
+# today and yesterday as estimated (pending meter reconciliation).
+# Data older than this many days is considered actual.
+ESTIMATED_DAYS = 2
+
+# How many extra days beyond ESTIMATED_DAYS to re-process on each poll.
+# If estimated data slipped through before ESTIMATED_DAYS elapsed, re-
+# processing this window lets upserts correct it with actual data.
+# Total check window = ESTIMATED_DAYS + RECONCILIATION_DAYS (= 3 days).
+RECONCILIATION_DAYS = 1

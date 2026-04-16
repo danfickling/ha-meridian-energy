@@ -6,8 +6,8 @@ from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
-from meridian_energy.coordinator import MeridianCoordinator, MeridianData, _energy_stat_id, _cost_stat_id, _is_estimated_value
-from meridian_energy.const import DEFAULT_BRAND, DOMAIN, PERIOD_OFFPEAK, PERIOD_CONTROLLED, ESTIMATE_PRECISION_THRESHOLD
+from meridian_energy.coordinator import MeridianCoordinator, MeridianData, _energy_stat_id, _cost_stat_id, _is_estimated_data
+from meridian_energy.const import DEFAULT_BRAND, DOMAIN, PERIOD_OFFPEAK, PERIOD_CONTROLLED, ESTIMATED_DAYS, RECONCILIATION_DAYS
 
 NZ_TZ = ZoneInfo("Pacific/Auckland")
 
@@ -745,14 +745,14 @@ class TestFutureTimestampFiltering:
         with patch("meridian_energy.coordinator.async_add_external_statistics",
                    side_effect=lambda *a: calls.append(a)):
             coord._publish_hourly_consumption_stats(
-                nodes, now=now,
+                nodes, now=now, skip_estimated=False,
             )
 
         # Only past data (0.5 + 0.3 = 0.8) counted; future (0.9 + 0.7) skipped
         assert abs(coord._energy_sums["night"] - 0.8) < 1e-9
 
     def test_daily_charge_skips_future_days(self):
-        """Daily charge for a future date should not be published."""
+        """Daily charge for a future date should not be published (skip_estimated off to isolate future filter)."""
         coord = _make_coordinator(daily_charge=4.14)
         coord.hass = MagicMock()
 
@@ -779,14 +779,14 @@ class TestFutureTimestampFiltering:
         with patch("meridian_energy.coordinator.async_add_external_statistics",
                    side_effect=lambda *a: calls.append(a)):
             coord._publish_daily_charge_stats(
-                nodes, now=now,
+                nodes, now=now, skip_estimated=False,
             )
 
         # Only 1 day published (Apr 10), not 2
         assert abs(coord._daily_charge_sum - 4.14) < 0.01
 
     def test_hourly_no_filter_when_now_none(self):
-        """When now is None, all entries should be published (backwards compat)."""
+        """When now is None and skip_estimated is off, all entries should be published."""
         coord = _make_coordinator(
             rates={"night": 0.2362},
             schedule={
@@ -805,10 +805,10 @@ class TestFutureTimestampFiltering:
 
         with patch("meridian_energy.coordinator.async_add_external_statistics"):
             coord._publish_hourly_consumption_stats(
-                nodes, now=None,
+                nodes, now=None, skip_estimated=False,
             )
 
-        # Should still publish (no now filter)
+        # Should still publish (no filters active)
         assert abs(coord._energy_sums["night"] - 1.0) < 1e-9
 
 
@@ -833,7 +833,7 @@ class TestDailyChargeTodayFallback:
         }
 
         with patch("meridian_energy.coordinator.async_add_external_statistics"):
-            coord._publish_daily_charge_stats([node])
+            coord._publish_daily_charge_stats([node], skip_estimated=False)
 
         # Should use full day rate ($4.14), not prorated $2.77
         assert coord._daily_charge_sum == 4.14
@@ -942,13 +942,59 @@ class TestBackfill:
         with patch("meridian_energy.coordinator.get_instance", return_value=recorder_mock), \
              patch("meridian_energy.coordinator.statistics_during_period",
                    side_effect=mock_stats_during_period), \
-             patch("meridian_energy.coordinator.async_add_external_statistics"):
+             patch("meridian_energy.coordinator.async_add_external_statistics"), \
+             patch.object(coord, "_async_delete_statistics_range",
+                          new_callable=AsyncMock, return_value=0):
             self._run(coord.async_backfill(date(2026, 4, 6)))
 
         # Daily charge should have been seeded from 4200 + 4.14
         assert coord._daily_charge_sum == 4200.0 + 4.14
         # Energy sums should have been seeded from 100
         assert coord._energy_sums["night"] == 100.0
+
+    def test_backfill_calls_delete_statistics_range(self):
+        """Backfill should delete existing stats before re-publishing."""
+        from datetime import date
+
+        coord = _make_coordinator(
+            daily_charge=4.14,
+            rate_to_period={23.62: "night"},
+            detected_periods=["night"],
+        )
+        coord.hass = MagicMock()
+        coord._async_refresh_rates = AsyncMock()
+        coord._last_rates_refresh = None
+
+        recorder_mock = MagicMock()
+        recorder_mock.async_add_executor_job = AsyncMock(
+            side_effect=lambda fn, *a, **kw: fn(*a, **kw)
+        )
+
+        def mock_stats_during_period(
+            hass, start_time, end_time, stat_ids, period, units, types
+        ):
+            return {}
+
+        coord._api.async_get_daily_cost_measurements = AsyncMock(return_value=[])
+        coord._api.async_get_measurements = AsyncMock(return_value=[])
+
+        delete_mock = AsyncMock(return_value=0)
+        with patch("meridian_energy.coordinator.get_instance", return_value=recorder_mock), \
+             patch("meridian_energy.coordinator.statistics_during_period",
+                   side_effect=mock_stats_during_period), \
+             patch("meridian_energy.coordinator.async_add_external_statistics"), \
+             patch.object(coord, "_async_delete_statistics_range",
+                          new=delete_mock):
+            self._run(coord.async_backfill(date(2026, 4, 6)))
+
+        # Verify _async_delete_statistics_range was called with correct range
+        delete_mock.assert_called_once()
+        call_args = delete_mock.call_args
+        start_arg = call_args[0][0]
+        end_arg = call_args[0][1]
+        assert start_arg.date() == date(2026, 4, 6)
+        # end extends to now or beyond the end_date
+        assert end_arg > start_arg
 
 
 class TestGapFilling:
@@ -1285,45 +1331,58 @@ class TestEstimateDetection:
             ],
         }
 
-    # -- _is_estimated_value unit tests ------------------------------------
+    # -- _is_estimated_data unit tests ------------------------------------
 
-    def test_estimated_value_high_precision(self):
-        """Values with many significant decimals are estimated."""
-        assert _is_estimated_value("21.28208437045405498041797199") is True
+    def test_estimated_today(self):
+        """Data from today is estimated."""
+        now = datetime(2026, 4, 13, 18, 0, tzinfo=NZ_TZ)
+        assert _is_estimated_data("2026-04-13T10:00:00+12:00", now) is True
 
-    def test_actual_value_three_decimals(self):
-        """Values with exactly 3 significant decimals are actual."""
-        assert _is_estimated_value("24.854000000000000000") is False
+    def test_estimated_yesterday(self):
+        """Data from yesterday is estimated."""
+        now = datetime(2026, 4, 13, 18, 0, tzinfo=NZ_TZ)
+        assert _is_estimated_data("2026-04-12T10:00:00+12:00", now) is True
 
-    def test_actual_value_fewer_decimals(self):
-        """Values with fewer than 3 decimals are actual."""
-        assert _is_estimated_value("0.14") is False
-        assert _is_estimated_value("5.0") is False
+    def test_actual_two_days_ago(self):
+        """Data from 2 days ago is actual (ESTIMATED_DAYS=2)."""
+        now = datetime(2026, 4, 13, 18, 0, tzinfo=NZ_TZ)
+        assert _is_estimated_data("2026-04-11T10:00:00+12:00", now) is False
 
-    def test_integer_value_not_estimated(self):
-        """Integer values (no dot) are not estimated."""
-        assert _is_estimated_value("100") is False
+    def test_actual_three_days_ago(self):
+        """Data from 3 days ago is actual."""
+        now = datetime(2026, 4, 13, 18, 0, tzinfo=NZ_TZ)
+        assert _is_estimated_data("2026-04-10T23:30:00+12:00", now) is False
 
-    def test_non_string_not_estimated(self):
-        """Non-string values are not estimated."""
-        assert _is_estimated_value(0.5) is False  # type: ignore[arg-type]
-        assert _is_estimated_value(None) is False  # type: ignore[arg-type]
+    def test_actual_old_data(self):
+        """Data from a week ago is actual."""
+        now = datetime(2026, 4, 13, 18, 0, tzinfo=NZ_TZ)
+        assert _is_estimated_data("2026-04-06T10:00:00+12:00", now) is False
 
-    def test_empty_string_not_estimated(self):
-        assert _is_estimated_value("") is False
+    def test_estimated_empty_string(self):
+        """Empty string is treated as estimated (safe default)."""
+        assert _is_estimated_data("") is True
 
-    def test_hh_estimated_value(self):
-        """Half-hourly estimated values have very high precision."""
-        assert _is_estimated_value("0.3027351814061196476380862504") is True
+    def test_estimated_invalid_string(self):
+        """Invalid date string is treated as estimated (safe default)."""
+        assert _is_estimated_data("not-a-date") is True
 
-    def test_hh_actual_value(self):
-        """Half-hourly actual values have 3 significant decimals."""
-        assert _is_estimated_value("0.178000000000000000") is False
+    def test_estimated_none_now(self):
+        """When now is None, uses current time."""
+        # A date far in the past should be actual regardless
+        assert _is_estimated_data("2020-01-01T00:00:00+12:00") is False
+
+    def test_boundary_midnight(self):
+        """Data at cutoff boundary (midnight of yesterday) is estimated."""
+        now = datetime(2026, 4, 13, 0, 0, tzinfo=NZ_TZ)
+        # Cutoff is midnight Apr 12.  Apr 11 23:30 is before cutoff → actual
+        assert _is_estimated_data("2026-04-11T23:30:00+12:00", now) is False
+        # Apr 12 00:00 is at cutoff → estimated
+        assert _is_estimated_data("2026-04-12T00:00:00+12:00", now) is True
 
     # -- Hourly publish method tests ----------------------------------------
 
     def test_hourly_skips_estimated_data(self):
-        """HH nodes with high-precision values should be skipped."""
+        """HH nodes from recent days should be skipped as estimated."""
         coord = _make_coordinator(
             rates={"night": 0.2362},
             schedule=self._make_schedule(),
@@ -1333,12 +1392,12 @@ class TestEstimateDetection:
         now = datetime(2026, 4, 13, 12, 0, tzinfo=NZ_TZ)
 
         nodes = [
-            # Actual (3 sig decimals)
+            # Old data (actual - 3 days ago)
             {"startAt": "2026-04-10T22:00:00+12:00", "value": "0.500000000000000000"},
             {"startAt": "2026-04-10T22:30:00+12:00", "value": "0.300000000000000000"},
-            # Estimated (many sig decimals)
-            {"startAt": "2026-04-13T00:00:00+12:00", "value": "0.3027351814061196476380862504"},
-            {"startAt": "2026-04-13T00:30:00+12:00", "value": "0.2846562414809106340984746517"},
+            # Recent data (estimated - today)
+            {"startAt": "2026-04-13T00:00:00+12:00", "value": "0.302000000000000000"},
+            {"startAt": "2026-04-13T00:30:00+12:00", "value": "0.284000000000000000"},
         ]
 
         with patch("meridian_energy.coordinator.async_add_external_statistics"):
@@ -1348,28 +1407,30 @@ class TestEstimateDetection:
         assert abs(coord._energy_sums["night"] - 0.8) < 1e-9
 
     def test_hourly_no_filter_when_skip_estimated_false(self):
-        """When skip_estimated=False, all data including estimates is published."""
+        """When skip_estimated=False, all data including recent is published."""
         coord = _make_coordinator(
             rates={"night": 0.2362},
             schedule=self._make_schedule(),
         )
         coord.hass = MagicMock()
 
+        now = datetime(2026, 4, 13, 12, 0, tzinfo=NZ_TZ)
+
         nodes = [
-            {"startAt": "2026-04-13T00:00:00+12:00", "value": "0.3027351814061196476380862504"},
-            {"startAt": "2026-04-13T00:30:00+12:00", "value": "0.2846562414809106340984746517"},
+            {"startAt": "2026-04-13T00:00:00+12:00", "value": "0.302000000000000000"},
+            {"startAt": "2026-04-13T00:30:00+12:00", "value": "0.284000000000000000"},
         ]
 
         with patch("meridian_energy.coordinator.async_add_external_statistics"):
-            coord._publish_hourly_consumption_stats(nodes, skip_estimated=False)
+            coord._publish_hourly_consumption_stats(nodes, skip_estimated=False, now=now)
 
-        # Both estimated values published
+        # Both values published
         assert coord._energy_sums["night"] > 0.5
 
     # -- Daily consumption tests --------------------------------------------
 
     def test_daily_consumption_skips_estimated_data(self):
-        """Daily consumption nodes with high-precision values should be skipped."""
+        """Daily consumption nodes from recent days should be skipped."""
         coord = _make_coordinator(
             rates={"night": 0.2362},
             rate_to_period={23.62: "night"},
@@ -1390,7 +1451,7 @@ class TestEstimateDetection:
             },
             {
                 "startAt": "2026-04-13T00:00:00+12:00",
-                "value": "21.28208437045405498041797199",
+                "value": "21.282000000000000000",
                 "metaData": {"statistics": [{
                     "label": "CONSUMPTION_CHARGE_TOU_abc",
                     "value": "18.0",
@@ -1408,7 +1469,7 @@ class TestEstimateDetection:
     # -- Daily charge tests -------------------------------------------------
 
     def test_daily_charge_skips_estimated_data(self):
-        """Daily charge nodes with high-precision values should be skipped."""
+        """Daily charge nodes from recent days should be skipped."""
         coord = _make_coordinator(daily_charge=4.14)
         coord.hass = MagicMock()
 
@@ -1425,7 +1486,7 @@ class TestEstimateDetection:
             },
             {
                 "startAt": "2026-04-13T00:00:00+12:00",
-                "value": "21.28208437045405498041797199",
+                "value": "21.282000000000000000",
                 "metaData": {"statistics": [{
                     "label": "STANDING_CHARGE_abc",
                     "costInclTax": {"estimatedAmount": "414"},
@@ -1442,7 +1503,7 @@ class TestEstimateDetection:
     # -- Solar tests --------------------------------------------------------
 
     def test_solar_skips_estimated_data(self):
-        """Solar export nodes with high-precision values should be skipped."""
+        """Solar export nodes from recent days should be skipped."""
         coord = _make_coordinator()
         coord.hass = MagicMock()
 
@@ -1450,7 +1511,7 @@ class TestEstimateDetection:
 
         nodes = [
             {"startAt": "2026-04-10T00:00:00+12:00", "value": "5.300000000000000000"},
-            {"startAt": "2026-04-13T00:00:00+12:00", "value": "4.10283719204815924"},
+            {"startAt": "2026-04-13T00:00:00+12:00", "value": "4.102000000000000000"},
         ]
 
         with patch("meridian_energy.coordinator.async_add_external_statistics"):
@@ -1461,7 +1522,14 @@ class TestEstimateDetection:
 
     # -- Constant test ------------------------------------------------------
 
-    def test_estimate_precision_threshold_constant(self):
-        """ESTIMATE_PRECISION_THRESHOLD should be a positive integer."""
-        assert ESTIMATE_PRECISION_THRESHOLD >= 1
-        assert isinstance(ESTIMATE_PRECISION_THRESHOLD, int)
+    def test_estimated_days_constant(self):
+        """ESTIMATED_DAYS should be a positive integer."""
+        assert ESTIMATED_DAYS >= 1
+        assert isinstance(ESTIMATED_DAYS, int)
+
+    def test_reconciliation_days_constant(self):
+        """RECONCILIATION_DAYS should be a positive integer."""
+        assert RECONCILIATION_DAYS >= 1
+        assert isinstance(RECONCILIATION_DAYS, int)
+        # Total check window = ESTIMATED_DAYS + RECONCILIATION_DAYS
+        assert ESTIMATED_DAYS + RECONCILIATION_DAYS == 3

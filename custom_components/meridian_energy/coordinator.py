@@ -322,7 +322,6 @@ class MeridianCoordinator(DataUpdateCoordinator[MeridianData]):
         )
 
         # -- Fetch API data --------------------------------------------
-        hh_start = max(start_dt, fetch_end - timedelta(days=30))
         daily_nodes: list[dict] = []
         half_hourly_nodes: list[dict] = []
         try:
@@ -333,7 +332,7 @@ class MeridianCoordinator(DataUpdateCoordinator[MeridianData]):
             _LOGGER.warning("Backfill: daily cost fetch failed: %s", err)
         try:
             half_hourly_nodes = await self._api.async_get_measurements(
-                hh_start, fetch_end,
+                start_dt, fetch_end,
                 frequency="THIRTY_MIN_INTERVAL",
                 direction="CONSUMPTION",
             )
@@ -376,12 +375,6 @@ class MeridianCoordinator(DataUpdateCoordinator[MeridianData]):
 
             self._publish_hourly_consumption_stats(
                 half_hourly_nodes,
-                skip_before=skip,
-                now=now,
-            )
-        elif daily_nodes:
-            self._publish_daily_consumption_stats(
-                daily_nodes,
                 skip_before=skip,
                 now=now,
             )
@@ -729,11 +722,7 @@ class MeridianCoordinator(DataUpdateCoordinator[MeridianData]):
         else:
             start = now - timedelta(days=DEFAULT_LOOKBACK_DAYS)
 
-        # Half-hourly lookback is capped — the API rarely serves
-        # more than ~30 days of half-hourly data.
-        hh_start = max(start, now - timedelta(days=30))
-
-        # Daily cost measurements (for daily charge + cost sensor)
+        # Daily cost measurements (for daily charge / standing charge)
         daily_nodes: list[dict] = []
         try:
             daily_nodes = await self._api.async_get_daily_cost_measurements(
@@ -747,7 +736,7 @@ class MeridianCoordinator(DataUpdateCoordinator[MeridianData]):
         half_hourly_nodes: list[dict] = []
         try:
             half_hourly_nodes = await self._api.async_get_measurements(
-                hh_start, now,
+                start, now,
                 frequency="THIRTY_MIN_INTERVAL",
                 direction="CONSUMPTION",
             )
@@ -756,44 +745,8 @@ class MeridianCoordinator(DataUpdateCoordinator[MeridianData]):
 
         if daily_nodes or half_hourly_nodes:
             # Per-period energy/cost: hourly resolution from half-hourly
-            # data (preferred), or daily fallback.  We do NOT reprocess
-            # old daily per-period data alongside hourly data because
-            # the two sources use different TOU classification methods,
-            # producing sum discontinuities.  Historical per-period
-            # entries (before the HH window) are retained as-is from
-            # prior runs or backup imports.
-            #
-            # EXCEPTION: if the latest DB entry is older than the
-            # half-hourly window (>30 day gap), fill the gap with
-            # daily-resolution data so the energy dashboard doesn't
-            # have a hole.
+            # data.
             if half_hourly_nodes:
-                if daily_nodes and energy_skip is not None:
-                    hh_min_str = min(
-                        (n.get("startAt", "") for n in half_hourly_nodes),
-                        default="",
-                    )
-                    if hh_min_str:
-                        hh_earliest = datetime.fromisoformat(hh_min_str)
-                        if energy_skip < hh_earliest - timedelta(hours=1):
-                            gap_nodes = [
-                                n for n in daily_nodes
-                                if n.get("startAt", "") < hh_min_str
-                            ]
-                            if gap_nodes:
-                                _LOGGER.info(
-                                    "Filling %d-day gap with daily data"
-                                    " (DB latest=%s, HH start=%s)",
-                                    (hh_earliest - energy_skip).days,
-                                    energy_skip.date(),
-                                    hh_earliest.date(),
-                                )
-                                self._publish_daily_consumption_stats(
-                                    gap_nodes,
-                                    skip_before=energy_skip,
-                                    now=now,
-                                )
-
                 # Reconciliation: push skip boundary back by
                 # OVERLAP_DAYS so that newly-reconciled actual data
                 # from the API is re-published over any stale entries
@@ -847,12 +800,6 @@ class MeridianCoordinator(DataUpdateCoordinator[MeridianData]):
 
                 self._publish_hourly_consumption_stats(
                     half_hourly_nodes,
-                    skip_before=energy_skip,
-                    now=now,
-                )
-            elif daily_nodes:
-                self._publish_daily_consumption_stats(
-                    daily_nodes,
                     skip_before=energy_skip,
                     now=now,
                 )
@@ -1051,122 +998,6 @@ class MeridianCoordinator(DataUpdateCoordinator[MeridianData]):
             {
                 p: f"{self._energy_sums[p]:.1f}kWh/${self._cost_sums[p]:.2f}"
                 for p in energy_stats
-                if self._energy_sums[p] > 0
-            },
-        )
-
-    def _publish_daily_consumption_stats(
-        self, nodes: list[dict], *,
-        skip_before: datetime | None = None,
-        now: datetime | None = None,
-    ) -> None:
-        """Fallback: publish per-period stats at daily resolution.
-
-        Used when half-hourly data is unavailable.  Extracts per-period
-        energy and cost from the daily cost node's ``metaData.statistics``
-        TOU breakdown.
-
-        When *skip_before* is set, entries at or before that timestamp
-        are skipped (already in DB).
-        """
-
-        sorted_nodes = sorted(nodes, key=lambda n: n.get("startAt", ""))
-
-        energy_data: dict[str, list[StatisticData]] = defaultdict(list)
-        cost_data: dict[str, list[StatisticData]] = defaultdict(list)
-
-        for node in sorted_nodes:
-            start_str = node.get("startAt")
-            if not start_str:
-                continue
-
-            ts = datetime.fromisoformat(start_str)
-            date_only = ts.date()
-            ts = datetime.combine(
-                date_only, datetime.min.time(), tzinfo=NZ_TZ,
-            )
-
-            # Skip future days.
-            if now is not None and ts > now:
-                continue
-
-            for stat in (
-                (node.get("metaData") or {}).get("statistics") or []
-            ):
-                period = self._identify_stat_period(stat)
-                if not period:
-                    continue
-
-                # Skip data that already exists in DB.
-                if skip_before is not None and ts <= skip_before:
-                    continue
-
-                kwh = max(0.0, float(stat.get("value") or 0))
-                cost_incl = stat.get("costInclTax") or {}
-                cost_nzd = max(
-                    0.0,
-                    float(cost_incl.get("estimatedAmount") or 0) / 100.0,
-                )
-
-                self._energy_sums[period] += kwh
-                self._cost_sums[period] += cost_nzd
-                energy_data[period].append(
-                    StatisticData(
-                        start=ts, state=kwh,
-                        sum=self._energy_sums[period],
-                    )
-                )
-                cost_data[period].append(
-                    StatisticData(
-                        start=ts, state=cost_nzd,
-                        sum=self._cost_sums[period],
-                    )
-                )
-
-        for period in energy_data:
-            if energy_data[period]:
-                async_add_external_statistics(
-                    self.hass,
-                    StatisticMetaData(
-                        has_mean=False,
-                        has_sum=True,
-                        name=(
-                            f"{self._sensor_name}"
-                            f" ({period_display_name(period)})"
-                        ),
-                        source=DOMAIN,
-                        statistic_id=_energy_stat_id(period),
-                        unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-                        mean_type=StatisticMeanType.NONE,
-                        unit_class="energy",
-                    ),
-                    energy_data[period],
-                )
-            if cost_data[period]:
-                async_add_external_statistics(
-                    self.hass,
-                    StatisticMetaData(
-                        has_mean=False,
-                        has_sum=True,
-                        name=(
-                            f"{self._sensor_name} Cost"
-                            f" ({period_display_name(period)})"
-                        ),
-                        source=DOMAIN,
-                        statistic_id=_cost_stat_id(period),
-                        unit_of_measurement="NZD",
-                        mean_type=StatisticMeanType.NONE,
-                        unit_class=None,
-                    ),
-                    cost_data[period],
-                )
-
-        _LOGGER.info(
-            "Daily statistics published: %d days, %s",
-            len(sorted_nodes),
-            {
-                p: f"{self._energy_sums[p]:.1f}kWh/${self._cost_sums[p]:.2f}"
-                for p in energy_data
                 if self._energy_sums[p] > 0
             },
         )

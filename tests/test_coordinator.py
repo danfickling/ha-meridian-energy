@@ -250,8 +250,8 @@ class TestPublishConsumptionStats:
 
         assert coord._daily_charge_sum == 4.14 * 2
 
-    def test_incremental_daily_sums_continue(self, daily_cost_nodes):
-        """Incremental fetches must not reset cumulative sums to zero."""
+    def test_incremental_daily_charge_sums_continue(self, daily_cost_nodes):
+        """Incremental daily charge fetches must not reset cumulative sums."""
         coord = _make_coordinator(
             daily_charge=4.14,
             rate_to_period={23.62: "night", 40.77: "peak", 27.92: "offpeak"},
@@ -259,54 +259,13 @@ class TestPublishConsumptionStats:
         coord.hass = MagicMock()
 
         with patch("meridian_energy.coordinator.async_add_external_statistics"):
-            coord._publish_daily_consumption_stats(
-                daily_cost_nodes,
-            )
-            energy_after_first = dict(coord._energy_sums)
-            cost_after_first = dict(coord._cost_sums)
+            coord._publish_daily_charge_stats(daily_cost_nodes)
+            dc_after_first = coord._daily_charge_sum
 
-            # Second call with SAME nodes — skip_before prevents re-counting
-            skip = datetime.fromisoformat("2026-01-10T00:00:00+13:00")
-            coord._publish_daily_consumption_stats(
-                daily_cost_nodes, skip_before=skip,
-            )
+            # Second call with same nodes
+            coord._publish_daily_charge_stats(daily_cost_nodes)
 
-        assert dict(coord._energy_sums) == energy_after_first
-        assert dict(coord._cost_sums) == cost_after_first
-
-    def test_skip_before_prevents_recount(self):
-        """Entries at-or-before skip_before should not be re-counted."""
-        coord = _make_coordinator(
-            daily_charge=4.14,
-            rate_to_period={23.62: "night"},
-        )
-        coord.hass = MagicMock()
-
-        node_a = {
-            "startAt": "2026-01-05T00:00:00+13:00",
-            "metaData": {"statistics": [
-                {"label": "CONSUMPTION_CHARGE_TOU_plan1_nighthash",
-                 "value": "10.0", "costInclTax": {"estimatedAmount": "236.2"}},
-            ]},
-        }
-        node_b = {
-            "startAt": "2026-01-06T00:00:00+13:00",
-            "metaData": {"statistics": [
-                {"label": "CONSUMPTION_CHARGE_TOU_plan1_nighthash",
-                 "value": "5.0", "costInclTax": {"estimatedAmount": "118.1"}},
-            ]},
-        }
-
-        with patch("meridian_energy.coordinator.async_add_external_statistics"):
-            coord._publish_daily_consumption_stats([node_a])
-            assert coord._energy_sums["night"] == 10.0
-
-            # Second call with skip_before = node_a's date skips it
-            skip = datetime(2026, 1, 5, 0, 0, tzinfo=NZ_TZ)
-            coord._publish_daily_consumption_stats(
-                [node_a, node_b], skip_before=skip,
-            )
-            assert coord._energy_sums["night"] == 15.0
+        assert coord._daily_charge_sum == dc_after_first * 2
 
 
 class TestExtractPeriodEntries:
@@ -539,35 +498,8 @@ class TestSeedFromLatest:
         assert f"{DOMAIN}:consumption_night" in result
         assert result[f"{DOMAIN}:consumption_night"] == datetime(2026, 4, 9, tzinfo=NZ_TZ)
 
-    def test_seeded_sums_then_accumulates(self):
-        """Seeded sums from DB should be continued by API data on top."""
-        coord = _make_coordinator(
-            daily_charge=4.14,
-            rate_to_period={23.62: "night"},
-            detected_periods=["night"],
-        )
-        coord.hass = MagicMock()
-
-        # Pre-seed sums as if _async_seed_sums_from_db ran
-        coord._energy_sums["night"] = 6368.16
-        coord._cost_sums["night"] = 1155.63
-        coord._daily_charge_sum = 4200.83
-
-        node = {
-            "startAt": "2026-04-07T00:00:00+12:00",
-            "metaData": {"statistics": [
-                {"label": "CONSUMPTION_CHARGE_TOU_plan1_nighthash",
-                 "value": "3.8", "costInclTax": {"estimatedAmount": "89.76"}},
-            ]},
-        }
-
-        with patch("meridian_energy.coordinator.async_add_external_statistics"):
-            coord._publish_daily_consumption_stats([node])
-
-        assert coord._energy_sums["night"] == 6368.16 + 3.8
-
     def test_daily_charge_separate_from_consumption(self):
-        """Daily charge uses its own processed set."""
+        """Daily charge uses its own sum, independent of consumption."""
         coord = _make_coordinator(
             daily_charge=4.14,
             rate_to_period={23.62: "night"},
@@ -583,11 +515,9 @@ class TestSeedFromLatest:
         }
 
         with patch("meridian_energy.coordinator.async_add_external_statistics"):
-            coord._publish_daily_consumption_stats([node])
             coord._publish_daily_charge_stats([node])
 
         assert coord._daily_charge_sum == 4.14
-        assert coord._energy_sums["night"] == 3.8
 
 
 class TestHourlyConsumptionStats:
@@ -997,69 +927,6 @@ class TestBackfill:
         assert end_arg > start_arg
 
 
-class TestGapFilling:
-    """Tests for the daily fallback when there's a >30-day gap."""
-
-    def test_gap_filled_with_daily_data(self):
-        """When latest DB entry is before HH window, daily data fills gap."""
-        coord = _make_coordinator(
-            daily_charge=4.14,
-            rate_to_period={23.62: "night"},
-            detected_periods=["night"],
-        )
-        coord.hass = MagicMock()
-
-        # Simulate: global_skip is 45 days ago (before HH window)
-        global_skip = datetime(2026, 2, 25, 0, 0, tzinfo=NZ_TZ)
-
-        # Daily nodes covering the gap period
-        gap_daily_node = {
-            "startAt": "2026-03-01T00:00:00+13:00",
-            "metaData": {"statistics": [
-                {"label": "CONSUMPTION_CHARGE_TOU_plan1_nighthash",
-                 "value": "20.0", "costInclTax": {"estimatedAmount": "472.4"}},
-            ]},
-        }
-        # HH nodes start after the gap
-        hh_node = {
-            "startAt": "2026-04-06T08:00:00+12:00",
-            "endAt": "2026-04-06T08:30:00+12:00",
-            "value": "1.5",
-        }
-
-        published_calls = []
-        with patch("meridian_energy.coordinator.async_add_external_statistics",
-                   side_effect=lambda *a: published_calls.append(a)):
-            # Simulate the gap-filling logic from _async_fetch_and_publish_stats
-            daily_nodes = [gap_daily_node]
-            half_hourly_nodes = [hh_node]
-
-            hh_min_str = min(
-                (n.get("startAt", "") for n in half_hourly_nodes),
-                default="",
-            )
-            hh_earliest = datetime.fromisoformat(hh_min_str)
-            from datetime import timedelta
-            if global_skip < hh_earliest - timedelta(hours=1):
-                gap_nodes = [
-                    n for n in daily_nodes
-                    if n.get("startAt", "") < hh_min_str
-                ]
-                if gap_nodes:
-                    coord._publish_daily_consumption_stats(
-                        gap_nodes,
-                        skip_before=global_skip,
-                    )
-
-            coord._publish_hourly_consumption_stats(
-                half_hourly_nodes,
-                skip_before=global_skip,
-            )
-
-        # Gap daily node should have been processed
-        assert coord._energy_sums["night"] == 20.0
-
-
 class TestDailyChargeSanityCheck:
     """Verify anomalous standing charges are rejected."""
 
@@ -1277,31 +1144,6 @@ class TestNegativeValueClamping:
 
         # -0.5 clamped to 0, so only 0.3 kWh counted
         assert abs(coord._energy_sums["night"] - 0.3) < 1e-9
-
-    def test_negative_daily_consumption_clamped(self):
-        """Negative daily consumption values should be clamped to 0."""
-        coord = _make_coordinator(
-            rates={"night": 0.2362},
-            schedule=self._make_schedule(),
-            rate_to_period={0.2362: "night"},
-        )
-        coord.hass = MagicMock()
-
-        node = {
-            "startAt": "2026-01-05T00:00:00+13:00",
-            "metaData": {"statistics": [{
-                "label": "CONSUMPTION_CHARGE_TOU_abc",
-                "value": -2.0,
-                "costInclTax": {"estimatedAmount": -47},
-            }]},
-        }
-
-        with patch("meridian_energy.coordinator.async_add_external_statistics"):
-            coord._publish_daily_consumption_stats([node])
-
-        # Both should be clamped to 0
-        assert coord._energy_sums.get("night", 0.0) == 0.0
-        assert coord._cost_sums.get("night", 0.0) == 0.0
 
     def test_negative_solar_clamped(self):
         """Negative solar export should be clamped to 0."""

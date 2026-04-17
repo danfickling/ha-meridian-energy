@@ -81,14 +81,8 @@ PERIOD_DISPLAY_NAMES: dict[str, str] = {
 # Only used on first setup; subsequent polls resume incrementally.
 DEFAULT_LOOKBACK_DAYS = 3650
 
-# How many days of recent data to treat as estimated.
-# The Kraken API provides no explicit flag; the Powershop app treats
-# today and yesterday as estimated (pending meter reconciliation).
-# Data older than this many days is considered actual.
-ESTIMATED_DAYS = 2
-
-# How many extra days beyond ESTIMATED_DAYS to re-process on each poll.
-# If estimated data slipped through before ESTIMATED_DAYS elapsed, re-
-# processing this window lets upserts correct it with actual data.
-# Total check window = ESTIMATED_DAYS + RECONCILIATION_DAYS (= 3 days).
-RECONCILIATION_DAYS = 1
+# How many days of overlap to re-fetch on each poll so that
+# newly-reconciled actual data is picked up.  The API returns only
+# ACTUAL (meter-reconciled) readings; data typically takes 1-2 days
+# to become ACTUAL, so 3 days provides a comfortable safety margin.
+OVERLAP_DAYS = 3

@@ -626,6 +626,7 @@ query($acct: String!, $start: DateTime!, $end: DateTime!, $first: Int!, $after: 
           utilityFilters: [{{ electricityFilters: {{
             readingDirection: {direction}
             readingFrequencyType: {frequency}
+            readingQuality: ACTUAL
           }}}}]
           first: $first
           after: $after
@@ -634,7 +635,9 @@ query($acct: String!, $start: DateTime!, $end: DateTime!, $first: Int!, $after: 
           pageInfo {{ hasNextPage endCursor }}
           edges {{ node {{ ... on IntervalMeasurementType {{
             value unit startAt endAt
-            metaData {{ statistics {{ label value costInclTax {{ estimatedAmount }} }} }}
+            metaData {{
+              statistics {{ label value costInclTax {{ estimatedAmount }} }}
+            }}
           }}}}}}
         }}
       }}
@@ -655,6 +658,7 @@ query($acct: String!, $start: DateTime!, $end: DateTime!, $first: Int!, $after: 
           utilityFilters: [{ electricityFilters: {
             readingDirection: CONSUMPTION
             readingFrequencyType: DAY_INTERVAL
+            readingQuality: ACTUAL
           }}]
           first: $first
           after: $after

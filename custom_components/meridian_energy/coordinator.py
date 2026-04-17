@@ -46,10 +46,9 @@ from .const import (
     BRAND_CONFIG,
     DEFAULT_BRAND,
     DEFAULT_LOOKBACK_DAYS,
-    ESTIMATED_DAYS,
+    OVERLAP_DAYS,
     PERIOD_CONTROLLED,
     PERIOD_OFFPEAK,
-    RECONCILIATION_DAYS,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -59,26 +58,6 @@ NZ_TZ = ZoneInfo("Pacific/Auckland")
 # Data freshness threshold — if the most recent API measurement is older
 # than this, raise a repair issue so the user knows data is stale.
 STALE_DATA_THRESHOLD = timedelta(hours=48)
-
-
-def _is_estimated_data(start_str: str, now: datetime | None = None) -> bool:
-    """Return True if a measurement is considered estimated (too recent).
-
-    The Kraken API provides no explicit estimated flag.  The Powershop
-    app treats today's and yesterday's data as estimated because smart
-    meter reads go through a reconciliation process that typically takes
-    two days.  We replicate that heuristic here.
-    """
-    if not start_str:
-        return True
-    try:
-        ts = datetime.fromisoformat(start_str)
-    except (ValueError, TypeError):
-        return True
-    ref = (now or datetime.now(NZ_TZ)).astimezone(NZ_TZ)
-    cutoff = (ref.replace(hour=0, minute=0, second=0, microsecond=0)
-              - timedelta(days=ESTIMATED_DAYS - 1))
-    return ts.astimezone(NZ_TZ) >= cutoff
 
 
 def _energy_stat_id(period: str) -> str:
@@ -271,8 +250,8 @@ class MeridianCoordinator(DataUpdateCoordinator[MeridianData]):
             now,
         )
 
-        # Delete existing statistics in the backfill range so stale or
-        # estimated data is removed before re-publishing.
+        # Delete existing statistics in the backfill range so stale
+        # data is removed before re-publishing.
         await self._async_delete_statistics_range(start_dt, fetch_end)
 
         # Refresh rates first so _daily_charge and _rate_to_period
@@ -367,8 +346,6 @@ class MeridianCoordinator(DataUpdateCoordinator[MeridianData]):
         skip = seed_skip
 
         # -- Publish ---------------------------------------------------
-        # Skip estimated values even in backfills — we only want actual
-        # meter reads in long-term statistics.
         now = datetime.now(NZ_TZ)
         if half_hourly_nodes:
             # Adjust sums for the boundary hour (same logic as the
@@ -705,13 +682,12 @@ class MeridianCoordinator(DataUpdateCoordinator[MeridianData]):
         per-period statistics (energy dashboard), daily cost data for
         the daily charge stat and cost sensor, and solar generation data.
 
-        Every poll seeds cumulative sums from the database, fetches
-        API data with a ``ESTIMATED_DAYS + RECONCILIATION_DAYS`` day
-        overlap, skips estimated data (within ``ESTIMATED_DAYS``), and
-        re-processes the reconciliation window so that data which was
-        initially published from estimated API values is corrected once
-        actual meter reads are available.  The
-        ``async_add_external_statistics`` API performs upserts, so
+        Both API queries request ``readingQuality: ACTUAL`` so only
+        meter-reconciled data is returned.  Every poll seeds cumulative
+        sums from the database, fetches API data with an
+        ``OVERLAP_DAYS`` day overlap so that
+        newly-reconciled data is picked up, and the
+        ``async_add_external_statistics`` API performs upserts so
         re-publishing the same timestamp is safe.
         """
         now = datetime.now(NZ_TZ)
@@ -742,14 +718,13 @@ class MeridianCoordinator(DataUpdateCoordinator[MeridianData]):
         solar_skip = latest_map.get(f"{DOMAIN}:return_to_grid")
 
         # Determine fetch window from the latest known timestamp.
-        # Fetch ESTIMATED_DAYS + RECONCILIATION_DAYS worth of overlap
-        # so that data which recently passed the estimated threshold
-        # can be re-checked and upserted with actual values.
+        # Fetch OVERLAP_DAYS worth of overlap so that newly-reconciled
+        # actual data is picked up.
         all_ts = [t for t in latest_map.values() if t is not None]
         latest_ts = max(all_ts) if all_ts else None
         if latest_ts is not None:
             start = latest_ts - timedelta(
-                days=ESTIMATED_DAYS + RECONCILIATION_DAYS,
+                days=OVERLAP_DAYS,
             )
         else:
             start = now - timedelta(days=DEFAULT_LOOKBACK_DAYS)
@@ -778,10 +753,6 @@ class MeridianCoordinator(DataUpdateCoordinator[MeridianData]):
             )
         except (AuthError, ApiError) as err:
             _LOGGER.debug("Half-hourly measurements unavailable: %s", err)
-
-        # Estimated data filtering: each publish method checks individual
-        # node timestamps via _is_estimated_data() to skip recent data
-        # that hasn't been through meter reconciliation yet.
 
         if daily_nodes or half_hourly_nodes:
             # Per-period energy/cost: hourly resolution from half-hourly
@@ -824,15 +795,12 @@ class MeridianCoordinator(DataUpdateCoordinator[MeridianData]):
                                 )
 
                 # Reconciliation: push skip boundary back by
-                # RECONCILIATION_DAYS so that data which recently
-                # cleared the ESTIMATED_DAYS threshold gets
-                # re-processed and upserted with actual values.
-                # This replaces the simpler boundary-hour adjustment
-                # and ensures stale estimated data is corrected once
-                # the API provides reconciled reads.
+                # OVERLAP_DAYS so that newly-reconciled actual data
+                # from the API is re-published over any stale entries
+                # in the database.
                 if energy_skip is not None:
                     recon_start = energy_skip - timedelta(
-                        days=RECONCILIATION_DAYS,
+                        days=OVERLAP_DAYS,
                     )
                     recon_ids = set(
                         sid for sid in latest_map
@@ -937,7 +905,6 @@ class MeridianCoordinator(DataUpdateCoordinator[MeridianData]):
     def _publish_hourly_consumption_stats(
         self, nodes: list[dict], *,
         skip_before: datetime | None = None,
-        skip_estimated: bool = True,
         now: datetime | None = None,
     ) -> None:
         """Publish per-period energy/cost stats at hourly resolution.
@@ -954,10 +921,6 @@ class MeridianCoordinator(DataUpdateCoordinator[MeridianData]):
         timestamp are skipped.  The entry at *skip_before* itself is
         always re-aggregated so that partial hours (only one of two
         half-hourly nodes) can be completed on the next poll.
-
-        When *skip_estimated* is True (default), nodes whose timestamp
-        falls within the last ``ESTIMATED_DAYS`` days are skipped because
-        recent data hasn't been through meter reconciliation yet.
         """
 
         sorted_nodes = sorted(nodes, key=lambda n: n.get("startAt", ""))
@@ -979,10 +942,6 @@ class MeridianCoordinator(DataUpdateCoordinator[MeridianData]):
 
             # Skip data for hours that haven't started yet.
             if now is not None and hour_start > now:
-                continue
-
-            # Skip estimated data (too recent for meter reconciliation).
-            if skip_estimated and _is_estimated_data(start_str, now):
                 continue
 
             # Try to extract per-period breakdown from metadata stats.
@@ -1099,7 +1058,6 @@ class MeridianCoordinator(DataUpdateCoordinator[MeridianData]):
     def _publish_daily_consumption_stats(
         self, nodes: list[dict], *,
         skip_before: datetime | None = None,
-        skip_estimated: bool = True,
         now: datetime | None = None,
     ) -> None:
         """Fallback: publish per-period stats at daily resolution.
@@ -1110,10 +1068,6 @@ class MeridianCoordinator(DataUpdateCoordinator[MeridianData]):
 
         When *skip_before* is set, entries at or before that timestamp
         are skipped (already in DB).
-
-        When *skip_estimated* is True (default), nodes whose timestamp
-        falls within the last ``ESTIMATED_DAYS`` days are skipped because
-        recent data hasn't been through meter reconciliation yet.
         """
 
         sorted_nodes = sorted(nodes, key=lambda n: n.get("startAt", ""))
@@ -1134,10 +1088,6 @@ class MeridianCoordinator(DataUpdateCoordinator[MeridianData]):
 
             # Skip future days.
             if now is not None and ts > now:
-                continue
-
-            # Skip estimated data (too recent for meter reconciliation).
-            if skip_estimated and _is_estimated_data(start_str, now):
                 continue
 
             for stat in (
@@ -1224,7 +1174,6 @@ class MeridianCoordinator(DataUpdateCoordinator[MeridianData]):
     def _publish_daily_charge_stats(
         self, nodes: list[dict], *,
         skip_before: datetime | None = None,
-        skip_estimated: bool = True,
         now: datetime | None = None,
     ) -> None:
         """Publish daily charge statistics and cache latest daily cost.
@@ -1232,9 +1181,6 @@ class MeridianCoordinator(DataUpdateCoordinator[MeridianData]):
         When *skip_before* is set, skip API nodes whose date falls
         at or before that timestamp (already in DB).
 
-        When *skip_estimated* is True (default), nodes whose timestamp
-        falls within the last ``ESTIMATED_DAYS`` days are skipped because
-        recent data hasn't been through meter reconciliation yet.
         The latest daily cost for the balance sensor is still cached
         from all nodes regardless.
         """
@@ -1258,10 +1204,6 @@ class MeridianCoordinator(DataUpdateCoordinator[MeridianData]):
 
             # Skip future days.
             if now is not None and ts > now:
-                continue
-
-            # Skip estimated data (too recent for meter reconciliation).
-            if skip_estimated and _is_estimated_data(start_str, now):
                 continue
 
             # Skip dates that already have entries in the DB
@@ -1354,7 +1296,6 @@ class MeridianCoordinator(DataUpdateCoordinator[MeridianData]):
     def _publish_solar_stats(
         self, solar_nodes: list[dict], *,
         skip_before: datetime | None = None,
-        skip_estimated: bool = True,
         now: datetime | None = None,
     ) -> None:
         """Publish solar export statistics from daily generation data."""
@@ -1377,10 +1318,6 @@ class MeridianCoordinator(DataUpdateCoordinator[MeridianData]):
 
             # Skip future days.
             if now is not None and ts > now:
-                continue
-
-            # Skip estimated data (too recent for meter reconciliation).
-            if skip_estimated and _is_estimated_data(start_str, now):
                 continue
 
             if skip_before is not None and ts <= skip_before:

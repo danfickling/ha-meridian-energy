@@ -57,7 +57,7 @@ NZ_TZ = ZoneInfo("Pacific/Auckland")
 
 # Data freshness threshold — if the most recent API measurement is older
 # than this, raise a repair issue so the user knows data is stale.
-STALE_DATA_THRESHOLD = timedelta(hours=48)
+STALE_DATA_THRESHOLD = timedelta(days=4)
 
 
 def _energy_stat_id(period: str) -> str:
